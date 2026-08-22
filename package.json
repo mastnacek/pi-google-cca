@@ -1,0 +1,35 @@
+{
+  "name": "pi-google-cca",
+  "version": "1.0.0",
+  "description": "Google Cloud Code Assist OAuth for pi — browser OAuth login for the built-in google provider (Antigravity / Gemini CLI clients), streaming via the Cloud Code Assist wire API instead of an AI Studio API key.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "google",
+    "gemini",
+    "oauth",
+    "cloud-code-assist",
+    "antigravity"
+  ],
+  "license": "MIT",
+  "author": "mastnacek",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mastnacek/pi-google-cca.git"
+  },
+  "homepage": "https://github.com/mastnacek/pi-google-cca",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
+  }
+}
