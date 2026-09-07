@@ -169,6 +169,7 @@ export function transformMessages(messages: Message[], model: ModelWire, normali
 					return [{ type: "text", text: block.text ?? "" }];
 				}
 				if (block.type === "toolCall") {
+					// SAFETY: block type narrowed to toolCall
 					const toolCall = block as unknown as ToolCall;
 					let normalized: unknown = toolCall;
 					if (!isSameModel && toolCall.thoughtSignature) {
@@ -220,20 +221,21 @@ export function transformMessages(messages: Message[], model: ModelWire, normali
 			insertSyntheticToolResults();
 			const assistantMsg = msg as Message & { stopReason?: string };
 			if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") continue;
+			// SAFETY: content array is filtered to toolCall blocks
 			const toolCalls = (assistantMsg.content as AnyContent[]).filter(b => b.type === "toolCall") as unknown as ToolCall[];
 			if (toolCalls.length > 0) {
 				pendingToolCalls = toolCalls;
 				existingToolResultIds = new Set();
 			}
-			result.push(msg);
+			result.push(msg as Message);
 		} else if (msg.role === "toolResult") {
 			existingToolResultIds.add((msg as Message & { toolCallId: string }).toolCallId);
-			result.push(msg);
+			result.push(msg as Message);
 		} else if (msg.role === "user") {
 			insertSyntheticToolResults();
-			result.push(msg);
+			result.push(msg as Message);
 		} else {
-			result.push(msg);
+			result.push(msg as Message);
 		}
 	}
 	insertSyntheticToolResults();
@@ -307,6 +309,7 @@ export function convertMessages(model: ModelWire, context: Context): GeminiConte
 						parts.push({ text: sanitizeSurrogates(thinking.thinking) });
 					}
 				} else if (block.type === "toolCall") {
+					// SAFETY: block type narrowed to toolCall
 					const toolCall = block as unknown as ToolCall;
 					const thoughtSignature = resolveThoughtSignature(isSameProviderAndModel, toolCall.thoughtSignature);
 					parts.push({
@@ -429,11 +432,16 @@ function stringifyEnumValues(values: unknown[]): unknown[] {
 	);
 }
 
+export type NormalizedSchemaNode = Record<string, unknown> | unknown[] | string | number | boolean | null;
+
 /** Inline `$defs`/`definitions` references before the unsupported-key strip. */
-function dereference(value: unknown, defs: Map<string, unknown>, seen: Set<unknown>, depth: number): unknown {
+function dereference(value: unknown, defs: Map<string, unknown>, seen: Set<unknown>, depth: number): NormalizedSchemaNode {
 	if (depth > 32) return {};
 	if (Array.isArray(value)) return value.map(v => dereference(v, defs, seen, depth + 1));
-	if (typeof value !== "object" || value === null) return value;
+	if (typeof value !== "object" || value === null) {
+		// SAFETY: non-object primitive value
+		return value as NormalizedSchemaNode;
+	}
 	if (seen.has(value)) return {};
 	seen.add(value);
 	const record = value as Record<string, unknown>;
@@ -450,11 +458,14 @@ function dereference(value: unknown, defs: Map<string, unknown>, seen: Set<unkno
 	return out;
 }
 
-function normalizeNode(value: unknown): unknown {
+function normalizeNode(value: unknown): NormalizedSchemaNode {
 	// Boolean subschemas: true → permissive {}; false degraded to permissive too
 	// (the constraint is lost but the request no longer 400s).
 	if (typeof value === "boolean") return {};
-	if (typeof value !== "object" || value === null) return value;
+	if (typeof value !== "object" || value === null) {
+		// SAFETY: non-object primitive value
+		return value as NormalizedSchemaNode;
+	}
 	if (Array.isArray(value)) return value.map(normalizeNode);
 
 	const record = value as Record<string, unknown>;
@@ -511,7 +522,7 @@ function normalizeNode(value: unknown): unknown {
 }
 
 /** Normalize a tool schema for the Cloud Code Assist wire (omp normalizeSchemaForGoogle subset). */
-export function normalizeSchemaForWire(value: unknown): unknown {
+export function normalizeSchemaForWire(value: unknown): NormalizedSchemaNode {
 	// Collect $defs from the root for dereferencing, then normalize.
 	const root = typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 	const defs = new Map<string, unknown>();

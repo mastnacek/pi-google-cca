@@ -2,12 +2,16 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import {
   type GoogleCcaConfig,
-  loadCcaConfig,
   saveCcaConfig,
 } from "./config.ts";
+
+export interface AutocompleteItem {
+  value: string;
+  label: string;
+  description?: string;
+}
 
 export const ANSI_RESET = "\x1b[0m";
 export const ANSI_BOLD = "\x1b[1m";

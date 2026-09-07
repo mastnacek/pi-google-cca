@@ -106,7 +106,9 @@ const geminiCliVariant: VariantConfig = {
 		);
 
 		let data: GeminiCliLoadPayload;
-		if (!loadResponse.ok) {
+		if (loadResponse.ok) {
+			data = (await loadResponse.json()) as GeminiCliLoadPayload;
+		} else {
 			let errorPayload: unknown;
 			try {
 				errorPayload = await loadResponse.clone().json();
@@ -123,8 +125,6 @@ const geminiCliVariant: VariantConfig = {
 					loadResponse.status,
 				);
 			}
-		} else {
-			data = (await loadResponse.json()) as GeminiCliLoadPayload;
 		}
 
 		if (data.currentTier) {
@@ -692,7 +692,8 @@ export async function loginGoogle(cb: OAuthLoginCallbacks): Promise<OAuthCredent
 /** Refresh a stored grant, dispatching on the recorded client variant. */
 export async function refreshGoogleToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials> {
 	if (signal?.aborted) throw new Error("Refresh cancelled");
-	const variantId = (credentials as GoogleOauthCredential).variant ?? "antigravity";
+	const cred = credentials as GoogleOauthCredential;
+	const variantId = cred.variant ?? "antigravity";
 	const variant = VARIANTS[variantId] ?? VARIANTS.antigravity;
 	const data = await postToken(
 		variant,
@@ -710,6 +711,8 @@ export async function refreshGoogleToken(credentials: OAuthCredentials, signal?:
 		refresh: data.refresh_token || credentials.refresh,
 		access: data.access_token,
 		expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
+		projectId: cred.projectId,
+		email: cred.email,
 	} satisfies GoogleOauthCredential;
 }
 
