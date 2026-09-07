@@ -14,7 +14,10 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import * as http from "node:http";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import type {
+	OAuthCredentials,
+	OAuthLoginCallbacks,
+} from "@earendil-works/pi-ai";
 
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -53,7 +56,11 @@ interface VariantConfig {
 	callbackPath: string;
 	scopes: string[];
 	label: string;
-	discoverProject(accessToken: string, onProgress?: (m: string) => void, signal?: AbortSignal): Promise<string>;
+	discoverProject(
+		accessToken: string,
+		onProgress?: (m: string) => void,
+		signal?: AbortSignal,
+	): Promise<string>;
 }
 
 // --- Gemini CLI client ------------------------------------------------------
@@ -63,8 +70,14 @@ interface VariantConfig {
 // repository. Native/desktop OAuth clients cannot keep credentials secret by
 // design; they are not user secrets. Assembled at runtime purely so GitHub
 // push protection does not flag them.
-const geminiCliId = ["681255809395", "-oo8ft2oprdrnp9e3aqf6av3hmdib135j", ".apps.googleusercontent.com"].join("");
-const geminiCliSec = ["GOCSPX", "-4uHgMPm", "-1o7Sk", "-geV6Cu5clXFsxl"].join("");
+const geminiCliId = [
+	"681255809395",
+	"-oo8ft2oprdrnp9e3aqf6av3hmdib135j",
+	".apps.googleusercontent.com",
+].join("");
+const geminiCliSec = ["GOCSPX", "-4uHgMPm", "-1o7Sk", "-geV6Cu5clXFsxl"].join(
+	"",
+);
 
 const geminiCliVariant: VariantConfig = {
 	label: "Gemini CLI",
@@ -78,12 +91,15 @@ const geminiCliVariant: VariantConfig = {
 		"https://www.googleapis.com/auth/userinfo.profile",
 	],
 	async discoverProject(accessToken, onProgress, signal) {
-		const envProjectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT_ID;
+		const envProjectId =
+			process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT_ID;
 		const headers = {
 			Authorization: `Bearer ${accessToken}`,
 			"Content-Type": "application/json",
-			"User-Agent": "GeminiCLI/0.46.0/gemini-3.1-pro-preview (linux; x64; terminal)",
-			"Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+			"User-Agent":
+				"GeminiCLI/0.46.0/gemini-3.1-pro-preview (linux; x64; terminal)",
+			"Client-Metadata":
+				"ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
 		};
 
 		onProgress?.("Checking for existing Cloud Code Assist project...");
@@ -136,7 +152,7 @@ const geminiCliVariant: VariantConfig = {
 			);
 		}
 
-		const defaultTier = data.allowedTiers?.find(t => t.isDefault);
+		const defaultTier = data.allowedTiers?.find((t) => t.isDefault);
 		const tierId = defaultTier?.id ?? "free-tier";
 		if (tierId !== "free-tier" && !envProjectId) {
 			throw new OAuthFlowError(
@@ -145,10 +161,16 @@ const geminiCliVariant: VariantConfig = {
 			);
 		}
 
-		onProgress?.("Provisioning Cloud Code Assist project (this may take a moment)...");
+		onProgress?.(
+			"Provisioning Cloud Code Assist project (this may take a moment)...",
+		);
 		const onboardBody: Record<string, unknown> = {
 			tierId,
-			metadata: { ideType: "IDE_UNSPECIFIED", platform: "PLATFORM_UNSPECIFIED", pluginType: "GEMINI" },
+			metadata: {
+				ideType: "IDE_UNSPECIFIED",
+				platform: "PLATFORM_UNSPECIFIED",
+				pluginType: "GEMINI",
+			},
 		};
 		if (tierId !== "free-tier" && envProjectId) {
 			onboardBody.cloudaicompanionProject = envProjectId;
@@ -171,7 +193,15 @@ const geminiCliVariant: VariantConfig = {
 
 		let lro = (await onboardResponse.json()) as LongRunningOperation;
 		if (!lro.done && lro.name) {
-			lro = await pollOperation(`${GEMINI_CLI_ENDPOINT}/v1internal`, lro.name, headers, signal, onProgress, 24, 5_000);
+			lro = await pollOperation(
+				`${GEMINI_CLI_ENDPOINT}/v1internal`,
+				lro.name,
+				headers,
+				signal,
+				onProgress,
+				24,
+				5_000,
+			);
 		}
 
 		const projectId = lro.response?.cloudaicompanionProject?.id;
@@ -188,7 +218,11 @@ const geminiCliVariant: VariantConfig = {
 
 // Same situation as above: Antigravity's public native OAuth client
 // credentials, distributed inside the Antigravity IDE itself.
-const antigravityId = ["1071006060591", "-tmhssin2h21lcre235vtolojh4g403ep", ".apps.googleusercontent.com"].join("");
+const antigravityId = [
+	"1071006060591",
+	"-tmhssin2h21lcre235vtolojh4g403ep",
+	".apps.googleusercontent.com",
+].join("");
 const antigravitySec = ["GOCSPX", "-K58FWR486LdLJ1mLB8sXC4z6qDAf"].join("");
 
 const antigravityVariant: VariantConfig = {
@@ -234,9 +268,12 @@ const antigravityVariant: VariantConfig = {
 		onProgress?.("Checking Antigravity account status...");
 		const initial = await loadCodeAssist();
 
-		const freeAllowed = initial.allowedTiers?.some(t => t.id === "free-tier") === true;
+		const freeAllowed =
+			initial.allowedTiers?.some((t) => t.id === "free-tier") === true;
 		if (!freeAllowed) {
-			const ineligibility = initial.ineligibleTiers?.find(t => t.tierId === "free-tier");
+			const ineligibility = initial.ineligibleTiers?.find(
+				(t) => t.tierId === "free-tier",
+			);
 			if (ineligibility?.reasonMessage) {
 				throw new OAuthFlowError(
 					`${ineligibility.reasonMessage}${ineligibility.validationUrl ? `\n${ineligibility.validationUrl}` : ""}`,
@@ -253,7 +290,11 @@ const antigravityVariant: VariantConfig = {
 				headers,
 				{ tierId: "free-tier", metadata: { ideType: "ANTIGRAVITY" } },
 				signal,
-			)) as { name?: string; done?: boolean; error?: { code?: number; message?: string } };
+			)) as {
+				name?: string;
+				done?: boolean;
+				error?: { code?: number; message?: string };
+			};
 
 			for (;;) {
 				if (operation.done === true) {
@@ -266,10 +307,14 @@ const antigravityVariant: VariantConfig = {
 					}
 					break;
 				}
-				if (Date.now() >= deadline) throw new OAuthFlowError("onboardUser timed out after 30s", "timeout");
+				if (Date.now() >= deadline)
+					throw new OAuthFlowError("onboardUser timed out after 30s", "timeout");
 				await sleepUnlessAborted(1_000, signal);
 				if (!operation.name) {
-					throw new OAuthFlowError("onboardUser returned an operation without a name", "provisioning");
+					throw new OAuthFlowError(
+						"onboardUser returned an operation without a name",
+						"provisioning",
+					);
 				}
 				const pollResponse = await oauthFetch(
 					`${ANTIGRAVITY_ENDPOINT}/v1internal/${operation.name}`,
@@ -291,7 +336,10 @@ const antigravityVariant: VariantConfig = {
 		const refreshed = await loadCodeAssist();
 		const projectId = refreshed.cloudaicompanionProject;
 		if (projectId && projectId.length > 0) return projectId;
-		throw new OAuthFlowError("loadCodeAssist did not return a cloudaicompanionProject", "provisioning");
+		throw new OAuthFlowError(
+			"loadCodeAssist did not return a cloudaicompanionProject",
+			"provisioning",
+		);
 	},
 };
 
@@ -325,7 +373,11 @@ interface AntigravityLoadPayload {
 	currentTier?: { id?: string } | null;
 	paidTier?: { id?: string } | null;
 	allowedTiers?: Array<{ id?: string }>;
-	ineligibleTiers?: Array<{ tierId?: string; reasonMessage?: string; validationUrl?: string }>;
+	ineligibleTiers?: Array<{
+		tierId?: string;
+		reasonMessage?: string;
+		validationUrl?: string;
+	}>;
 	cloudaicompanionProject?: string;
 }
 
@@ -336,15 +388,25 @@ interface LongRunningOperation {
 }
 
 /** `fetch` with a per-request timeout and login-cancellation mapping. */
-async function oauthFetch(url: string, init: RequestInit, signal: AbortSignal | undefined): Promise<Response> {
+async function oauthFetch(
+	url: string,
+	init: RequestInit,
+	signal: AbortSignal | undefined,
+): Promise<Response> {
 	const timeoutSignal = AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS);
-	const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+	const requestSignal = signal
+		? AbortSignal.any([signal, timeoutSignal])
+		: timeoutSignal;
 	try {
 		return await fetch(url, { ...init, signal: requestSignal });
 	} catch (err) {
-		if (signal?.aborted) throw new Error(`OAuth login cancelled: ${String(signal.reason)}`);
+		if (signal?.aborted)
+			throw new Error(`OAuth login cancelled: ${String(signal.reason)}`);
 		if (timeoutSignal.aborted) {
-			throw new OAuthFlowError(`Timed out after ${OAUTH_REQUEST_TIMEOUT_MS}ms waiting for ${url}`, "timeout");
+			throw new OAuthFlowError(
+				`Timed out after ${OAUTH_REQUEST_TIMEOUT_MS}ms waiting for ${url}`,
+				"timeout",
+			);
 		}
 		throw err;
 	}
@@ -356,7 +418,11 @@ async function postJson(
 	body: Record<string, unknown>,
 	signal: AbortSignal | undefined,
 ): Promise<unknown> {
-	const response = await oauthFetch(url, { method: "POST", headers, body: JSON.stringify(body) }, signal);
+	const response = await oauthFetch(
+		url,
+		{ method: "POST", headers, body: JSON.stringify(body) },
+		signal,
+	);
 	if (response.status !== 200) {
 		const errorText = await response.text();
 		throw new OAuthFlowError(
@@ -379,18 +445,31 @@ async function pollOperation(
 ): Promise<LongRunningOperation> {
 	for (let attempt = 0; attempt < maxAttempts; attempt++) {
 		if (attempt > 0) {
-			onProgress?.(`Waiting for project provisioning (attempt ${attempt + 1}/${maxAttempts})...`);
+			onProgress?.(
+				`Waiting for project provisioning (attempt ${attempt + 1}/${maxAttempts})...`,
+			);
 			await sleepUnlessAborted(intervalMs, signal);
 		}
 		if (signal?.aborted) throw new Error("OAuth login cancelled");
-		const response = await oauthFetch(`${baseUrl}/${operationName}`, { method: "GET", headers }, signal);
+		const response = await oauthFetch(
+			`${baseUrl}/${operationName}`,
+			{ method: "GET", headers },
+			signal,
+		);
 		if (!response.ok) {
-			throw new OAuthFlowError(`Failed to poll operation: ${response.status} ${response.statusText}`, "polling", response.status);
+			throw new OAuthFlowError(
+				`Failed to poll operation: ${response.status} ${response.statusText}`,
+				"polling",
+				response.status,
+			);
 		}
 		const data = (await response.json()) as LongRunningOperation;
 		if (data.done) return data;
 	}
-	throw new OAuthFlowError(`Project provisioning did not complete after ${maxAttempts} attempts`, "timeout");
+	throw new OAuthFlowError(
+		`Project provisioning did not complete after ${maxAttempts} attempts`,
+		"timeout",
+	);
 }
 
 /** `setTimeout`-based sleep that rejects when the login is cancelled. */
@@ -409,9 +488,14 @@ function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 function isVpcScAffectedUser(payload: unknown): boolean {
-	if (!payload || typeof payload !== "object" || !("error" in payload)) return false;
-	const error = (payload as { error?: { details?: Array<{ reason?: string }> } }).error;
-	return Array.isArray(error?.details) && error.details.some(d => d?.reason === "SECURITY_POLICY_VIOLATED");
+	if (!payload || typeof payload !== "object" || !("error" in payload))
+		return false;
+	const error = (payload as { error?: { details?: Array<{ reason?: string }> } })
+		.error;
+	return (
+		Array.isArray(error?.details) &&
+		error.details.some((d) => d?.reason === "SECURITY_POLICY_VIOLATED")
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -457,23 +541,36 @@ function serveCallback(
 			const errorDescription = url.searchParams.get("error_description") ?? error;
 
 			if (error) {
-				res.writeHead(500, { "Content-Type": "text/html" }).end(RESULT_PAGE(false, errorDescription));
+				res
+					.writeHead(500, { "Content-Type": "text/html" })
+					.end(RESULT_PAGE(false, errorDescription));
 				// Only trust errors carrying our state nonce; any local process
 				// can forge the rest (omp #4106).
 				if (!expectedState || state === expectedState) {
-					reject(new OAuthFlowError(`Authorization failed: ${errorDescription}`, "user-denied"));
+					reject(
+						new OAuthFlowError(
+							`Authorization failed: ${errorDescription}`,
+							"user-denied",
+						),
+					);
 				}
 				return;
 			}
 			if (!code) {
-				res.writeHead(500, { "Content-Type": "text/html" }).end(RESULT_PAGE(false, "Missing authorization code"));
+				res
+					.writeHead(500, { "Content-Type": "text/html" })
+					.end(RESULT_PAGE(false, "Missing authorization code"));
 				return;
 			}
 			if (expectedState && state !== expectedState) {
-				res.writeHead(500, { "Content-Type": "text/html" }).end(RESULT_PAGE(false, "State mismatch"));
+				res
+					.writeHead(500, { "Content-Type": "text/html" })
+					.end(RESULT_PAGE(false, "State mismatch"));
 				return;
 			}
-			res.writeHead(200, { "Content-Type": "text/html" }).end(RESULT_PAGE(true, "You may now return to pi."));
+			res
+				.writeHead(200, { "Content-Type": "text/html" })
+				.end(RESULT_PAGE(true, "You may now return to pi."));
 			resolve({ code, state });
 		});
 		server.once("error", listenReject);
@@ -486,22 +583,51 @@ function serveCallback(
  * when busy), plus an ::1 companion so `localhost` traffic resolving to IPv6
  * still reaches us instead of some wildcard-bound dev server.
  */
-async function startCallbackServer(callbackPath: string, preferredPort: number, expectedState: string): Promise<CallbackHandle> {
-	const { promise: resultPromise, resolve, reject } = Promise.withResolvers<{ code: string; state: string }>();
+async function startCallbackServer(
+	callbackPath: string,
+	preferredPort: number,
+	expectedState: string,
+): Promise<CallbackHandle> {
+	const {
+		promise: resultPromise,
+		resolve,
+		reject,
+	} = Promise.withResolvers<{ code: string; state: string }>();
 	let primary: http.Server;
 	let primaryPort: number;
 	try {
-		primary = await serveCallback("127.0.0.1", preferredPort, callbackPath, expectedState, resolve, reject);
+		primary = await serveCallback(
+			"127.0.0.1",
+			preferredPort,
+			callbackPath,
+			expectedState,
+			resolve,
+			reject,
+		);
 		const addr = primary.address();
 		primaryPort = addr && typeof addr === "object" ? addr.port : preferredPort;
 	} catch {
 		// Port busy — fall back to an ephemeral port (Google allows any loopback port).
-		primary = await serveCallback("127.0.0.1", 0, callbackPath, expectedState, resolve, reject);
+		primary = await serveCallback(
+			"127.0.0.1",
+			0,
+			callbackPath,
+			expectedState,
+			resolve,
+			reject,
+		);
 		primaryPort = (primary.address() as { port: number }).port;
 	}
 
 	try {
-		await serveCallback("::1", primaryPort, callbackPath, expectedState, resolve, reject);
+		await serveCallback(
+			"::1",
+			primaryPort,
+			callbackPath,
+			expectedState,
+			resolve,
+			reject,
+		);
 	} catch {
 		/* IPv6 loopback unavailable — IPv4 listener serves alone. */
 	}
@@ -518,18 +644,27 @@ async function startCallbackServer(callbackPath: string, preferredPort: number, 
 }
 
 /** Parse a pasted redirect URL / query string / raw code into code+state. */
-export function parseCallbackInput(input: string): { code?: string; state?: string } {
+export function parseCallbackInput(input: string): {
+	code?: string;
+	state?: string;
+} {
 	const value = input.trim();
 	if (!value) return {};
 	try {
 		const url = new URL(value);
-		return { code: url.searchParams.get("code") ?? undefined, state: url.searchParams.get("state") ?? undefined };
+		return {
+			code: url.searchParams.get("code") ?? undefined,
+			state: url.searchParams.get("state") ?? undefined,
+		};
 	} catch {
 		/* not a URL */
 	}
 	if (value.includes("code=")) {
 		const params = new URLSearchParams(value.replace(/^[?#]/, ""));
-		return { code: params.get("code") ?? undefined, state: params.get("state") ?? undefined };
+		return {
+			code: params.get("code") ?? undefined,
+			state: params.get("state") ?? undefined,
+		};
 	}
 	const [code, state] = value.split("#", 2);
 	return { code, state };
@@ -545,7 +680,11 @@ interface TokenResponse {
 	expires_in: number;
 }
 
-async function postToken(variant: VariantConfig, body: Record<string, string>, signal?: AbortSignal): Promise<TokenResponse> {
+async function postToken(
+	variant: VariantConfig,
+	body: Record<string, string>,
+	signal?: AbortSignal,
+): Promise<TokenResponse> {
 	const response = await oauthFetch(
 		TOKEN_URL,
 		{
@@ -557,12 +696,19 @@ async function postToken(variant: VariantConfig, body: Record<string, string>, s
 	);
 	if (!response.ok) {
 		const detail = await response.text().catch(() => "");
-		throw new OAuthFlowError(`Google token endpoint failed (${response.status}): ${detail}`, "token-exchange", response.status);
+		throw new OAuthFlowError(
+			`Google token endpoint failed (${response.status}): ${detail}`,
+			"token-exchange",
+			response.status,
+		);
 	}
 	return (await response.json()) as TokenResponse;
 }
 
-async function getUserEmail(accessToken: string, signal?: AbortSignal): Promise<string | undefined> {
+async function getUserEmail(
+	accessToken: string,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
 	try {
 		const response = await oauthFetch(
 			"https://www.googleapis.com/oauth2/v1/userinfo?alt=json",
@@ -584,22 +730,36 @@ async function getUserEmail(accessToken: string, signal?: AbortSignal): Promise<
 // ---------------------------------------------------------------------------
 
 /** `/login google`: pick a client, run the browser flow, return credentials. */
-export async function loginGoogle(cb: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+export async function loginGoogle(
+	cb: OAuthLoginCallbacks,
+): Promise<OAuthCredentials> {
 	const selection = await cb.onSelect({
 		message: "Authenticate as which Google client?",
 		options: [
-			{ id: "antigravity", label: "Antigravity — newest Gemini models (daily-cloudcode-pa)" },
-			{ id: "gemini-cli", label: "Gemini CLI — standard Cloud Code Assist (cloudcode-pa)" },
+			{
+				id: "antigravity",
+				label: "Antigravity — newest Gemini models (daily-cloudcode-pa)",
+			},
+			{
+				id: "gemini-cli",
+				label: "Gemini CLI — standard Cloud Code Assist (cloudcode-pa)",
+			},
 		],
 	});
 	if (!selection) throw new Error("Login cancelled");
-	const variantId = (selection === "gemini-cli" ? "gemini-cli" : "antigravity") as GoogleVariantId;
+	const variantId = (
+		selection === "gemini-cli" ? "gemini-cli" : "antigravity"
+	) as GoogleVariantId;
 	const variant = VARIANTS[variantId];
 
 	const state = randomBytes(16).toString("hex");
 	if (cb.signal?.aborted) throw new Error("Login cancelled");
 
-	const handle = await startCallbackServer(variant.callbackPath, variant.callbackPort, state);
+	const handle = await startCallbackServer(
+		variant.callbackPath,
+		variant.callbackPort,
+		state,
+	);
 	try {
 		const authParams = new URLSearchParams({
 			client_id: variant.clientId,
@@ -618,11 +778,15 @@ export async function loginGoogle(cb: OAuthLoginCallbacks): Promise<OAuthCredent
 		);
 
 		const timeoutSignal = AbortSignal.timeout(CALLBACK_TIMEOUT_MS);
-		const waitSignal = cb.signal ? AbortSignal.any([cb.signal, timeoutSignal]) : timeoutSignal;
+		const waitSignal = cb.signal
+			? AbortSignal.any([cb.signal, timeoutSignal])
+			: timeoutSignal;
 
 		let code: string | undefined;
 		try {
-			const waits: Array<Promise<{ code: string; state: string }>> = [handle.result];
+			const waits: Array<Promise<{ code: string; state: string }>> = [
+				handle.result,
+			];
 			// Optional paste-the-code fallback for headless setups.
 			if (cb.onManualCodeInput) {
 				const manual = (async () => {
@@ -642,18 +806,29 @@ export async function loginGoogle(cb: OAuthLoginCallbacks): Promise<OAuthCredent
 					new Promise<never>((_, reject) =>
 						waitSignal.addEventListener(
 							"abort",
-							() => reject(new Error(`OAuth login cancelled or timed out: ${String(waitSignal.reason)}`)),
+							() =>
+								reject(
+									new Error(
+										`OAuth login cancelled or timed out: ${String(waitSignal.reason)}`,
+									),
+								),
 							{ once: true },
 						),
 					),
 				])
 			).code;
 		} catch (err) {
-			if (timeoutSignal.aborted) throw new OAuthFlowError("Timed out waiting for the browser callback (5 min).", "timeout");
+			if (timeoutSignal.aborted)
+				throw new OAuthFlowError(
+					"Timed out waiting for the browser callback (5 min).",
+					"timeout",
+				);
 			throw err;
 		}
 
-		cb.onProgress?.(`[${variant.label}] Exchanging authorization code for tokens...`);
+		cb.onProgress?.(
+			`[${variant.label}] Exchanging authorization code for tokens...`,
+		);
 		const tokenData = await postToken(
 			variant,
 			{
@@ -666,14 +841,23 @@ export async function loginGoogle(cb: OAuthLoginCallbacks): Promise<OAuthCredent
 			cb.signal,
 		);
 		if (!tokenData.refresh_token) {
-			throw new OAuthFlowError("No refresh token received — please retry the login.", "validation");
+			throw new OAuthFlowError(
+				"No refresh token received — please retry the login.",
+				"validation",
+			);
 		}
 
 		cb.onProgress?.(`[${variant.label}] Getting user info...`);
 		const email = await getUserEmail(tokenData.access_token, cb.signal);
 
-		cb.onProgress?.(`[${variant.label}] Discovering Cloud Code Assist project...`);
-		const projectId = await variant.discoverProject(tokenData.access_token, cb.onProgress, cb.signal);
+		cb.onProgress?.(
+			`[${variant.label}] Discovering Cloud Code Assist project...`,
+		);
+		const projectId = await variant.discoverProject(
+			tokenData.access_token,
+			cb.onProgress,
+			cb.signal,
+		);
 
 		return {
 			variant: variantId,
@@ -690,7 +874,10 @@ export async function loginGoogle(cb: OAuthLoginCallbacks): Promise<OAuthCredent
 }
 
 /** Refresh a stored grant, dispatching on the recorded client variant. */
-export async function refreshGoogleToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials> {
+export async function refreshGoogleToken(
+	credentials: OAuthCredentials,
+	signal?: AbortSignal,
+): Promise<OAuthCredentials> {
 	if (signal?.aborted) throw new Error("Refresh cancelled");
 	const cred = credentials as GoogleOauthCredential;
 	const variantId = cred.variant ?? "antigravity";
@@ -731,12 +918,16 @@ const INT63_MASK = (1n << 63n) - 1n;
 function signedDecimalSessionId(value: bigint): string {
 	return `-${(value & INT63_MASK).toString()}`;
 }
-export function deriveAntigravitySessionId(firstUserText: string | undefined): string {
+export function deriveAntigravitySessionId(
+	firstUserText: string | undefined,
+): string {
 	if (firstUserText && firstUserText.trim().length > 0) {
 		const digest = createHash("sha256").update(firstUserText).digest();
 		let value = 0n;
 		for (let i = 0; i < 8; i++) value = (value << 8n) | BigInt(digest[i] ?? 0);
 		return signedDecimalSessionId(value);
 	}
-	return signedDecimalSessionId(BigInt(`0x${randomBytes(8).toString("hex")}`) % 9_000_000_000_000_000_000n);
+	return signedDecimalSessionId(
+		BigInt(`0x${randomBytes(8).toString("hex")}`) % 9_000_000_000_000_000_000n,
+	);
 }

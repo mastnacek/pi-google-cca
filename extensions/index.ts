@@ -21,8 +21,19 @@
  */
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Api, AssistantMessage, AssistantMessageEventStream, Context, Model, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
-import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import type {
+	Api,
+	AssistantMessage,
+	AssistantMessageEventStream,
+	Context,
+	Model,
+	SimpleStreamOptions,
+	ThinkingLevel,
+} from "@earendil-works/pi-ai";
+import {
+	calculateCost,
+	createAssistantMessageEventStream,
+} from "@earendil-works/pi-ai";
 import {
 	convertMessages,
 	convertTools,
@@ -41,11 +52,6 @@ import {
 	loginGoogle,
 	refreshGoogleToken,
 } from "./oauth.ts";
-import {
-	type GoogleCcaConfig,
-	loadCcaConfig,
-} from "./config.ts";
-import { registerCcaCommands } from "./commands.ts";
 
 const GEMINI_CLI_ENDPOINT = "https://cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_ENDPOINTS = [
@@ -71,12 +77,30 @@ function geminiCliUserAgent(modelId: string): string {
 // logical id where a routed wire id is required yields 404 NOT_FOUND.
 // ---------------------------------------------------------------------------
 
-const ANTIGRAVITY_WIRE_PROFILES: Record<string, { modelEnum?: string; maxOutputTokens: number }> = {
-	"gemini-3.5-flash-extra-low": { modelEnum: "MODEL_PLACEHOLDER_M187", maxOutputTokens: 65_536 },
-	"gemini-3.5-flash-low": { modelEnum: "MODEL_PLACEHOLDER_M20", maxOutputTokens: 65_536 },
-	"gemini-3-flash-agent": { modelEnum: "MODEL_PLACEHOLDER_M132", maxOutputTokens: 65_536 },
-	"gemini-3.1-pro-low": { modelEnum: "MODEL_PLACEHOLDER_M36", maxOutputTokens: 65_535 },
-	"gemini-pro-agent": { modelEnum: "MODEL_PLACEHOLDER_M16", maxOutputTokens: 65_535 },
+const ANTIGRAVITY_WIRE_PROFILES: Record<
+	string,
+	{ modelEnum?: string; maxOutputTokens: number }
+> = {
+	"gemini-3.5-flash-extra-low": {
+		modelEnum: "MODEL_PLACEHOLDER_M187",
+		maxOutputTokens: 65_536,
+	},
+	"gemini-3.5-flash-low": {
+		modelEnum: "MODEL_PLACEHOLDER_M20",
+		maxOutputTokens: 65_536,
+	},
+	"gemini-3-flash-agent": {
+		modelEnum: "MODEL_PLACEHOLDER_M132",
+		maxOutputTokens: 65_536,
+	},
+	"gemini-3.1-pro-low": {
+		modelEnum: "MODEL_PLACEHOLDER_M36",
+		maxOutputTokens: 65_535,
+	},
+	"gemini-pro-agent": {
+		modelEnum: "MODEL_PLACEHOLDER_M16",
+		maxOutputTokens: 65_535,
+	},
 };
 
 /** pi google catalog id → antigravity upstream wire id per thinking effort. */
@@ -118,7 +142,10 @@ const ANTIGRAVITY_MODEL_ROUTING: Record<string, Record<string, string>> = {
 	},
 };
 
-function antigravityWireModelId(modelId: string, effort: string | undefined): string {
+function antigravityWireModelId(
+	modelId: string,
+	effort: string | undefined,
+): string {
 	const routing = ANTIGRAVITY_MODEL_ROUTING[modelId];
 	if (!routing) return modelId;
 	return routing[effort ?? "off"] ?? Object.values(routing)[0]!;
@@ -139,32 +166,51 @@ function isGemini3Pro(id: string): boolean {
 }
 function isGemini3Flash(id: string): boolean {
 	const lower = id.toLowerCase();
-	return /gemini-3(?:\.\d+)?-flash/.test(lower) || lower === "gemini-flash-latest" || lower === "gemini-flash-lite-latest";
+	return (
+		/gemini-3(?:\.\d+)?-flash/.test(lower) ||
+		lower === "gemini-flash-latest" ||
+		lower === "gemini-flash-lite-latest"
+	);
 }
 
-function thinkingConfigFor(model: Model<Api>, options: SimpleStreamOptions | undefined): ThinkingConfig | undefined {
+function thinkingConfigFor(
+	model: Model<Api>,
+	options: SimpleStreamOptions | undefined,
+): ThinkingConfig | undefined {
 	if (!model.reasoning) return undefined;
 
 	if (!options?.reasoning) {
 		// Explicit off. Gemini 3 models cannot fully disable thinking; hide it.
-		if (isGemini3Pro(model.id)) return { includeThoughts: false, thinkingLevel: "LOW" };
-		if (isGemini3Flash(model.id)) return { includeThoughts: false, thinkingLevel: "MINIMAL" };
+		if (isGemini3Pro(model.id))
+			return { includeThoughts: false, thinkingLevel: "LOW" };
+		if (isGemini3Flash(model.id))
+			return { includeThoughts: false, thinkingLevel: "MINIMAL" };
 		return { includeThoughts: false, thinkingBudget: 0 };
 	}
 
 	const effort: ThinkingLevel = options.reasoning;
 	if (isGemini3Pro(model.id)) {
-		return { includeThoughts: true, thinkingLevel: effort === "minimal" || effort === "low" ? "LOW" : "HIGH" };
+		return {
+			includeThoughts: true,
+			thinkingLevel: effort === "minimal" || effort === "low" ? "LOW" : "HIGH",
+		};
 	}
 	if (isGemini3Flash(model.id)) {
-		const level: GoogleThinkingLevel =
-			effort === "minimal" ? "MINIMAL" : effort === "low" ? "LOW" : effort === "medium" ? "MEDIUM" : "HIGH";
+		let level: GoogleThinkingLevel = "HIGH";
+		if (effort === "minimal") level = "MINIMAL";
+		else if (effort === "low") level = "LOW";
+		else if (effort === "medium") level = "MEDIUM";
 		return { includeThoughts: true, thinkingLevel: level };
 	}
 	// Token budgets for the 2.5 family.
 	const budgets: Record<string, Partial<Record<ThinkingLevel, number>>> = {
 		"gemini-2.5-pro": { minimal: 128, low: 2048, medium: 8192, high: 32_768 },
-		"gemini-2.5-flash-lite": { minimal: 512, low: 2048, medium: 8192, high: 24_576 },
+		"gemini-2.5-flash-lite": {
+			minimal: 512,
+			low: 2048,
+			medium: 8192,
+			high: 24_576,
+		},
 		"gemini-2.5-flash": { minimal: 128, low: 2048, medium: 8192, high: 24_576 },
 	};
 	const budget = (budgets[model.id] ?? {})[effort];
@@ -210,7 +256,7 @@ function firstUserText(context: Context): string | undefined {
 		if (message.role !== "user") continue;
 		if (typeof message.content === "string") return message.content;
 		if (Array.isArray(message.content)) {
-			const firstText = message.content.find(item => item.type === "text");
+			const firstText = message.content.find((item) => item.type === "text");
 			return firstText && "text" in firstText ? firstText.text : undefined;
 		}
 		return undefined;
@@ -225,11 +271,18 @@ function buildCcaRequest(
 	options: SimpleStreamOptions | undefined,
 	isAntigravity: boolean,
 ): CcaRequest {
-	const wireModel: ModelWire = { id: model.id, provider: model.provider, api: model.api, input: model.input };
+	const wireModel: ModelWire = {
+		id: model.id,
+		provider: model.provider,
+		api: model.api,
+		input: model.input,
+	};
 	const contents = convertMessages(wireModel, context);
 	const generationConfig: CcaRequest["request"]["generationConfig"] = {};
-	if (options?.temperature !== undefined) generationConfig.temperature = options.temperature;
-	if (options?.maxTokens !== undefined) generationConfig.maxOutputTokens = options.maxTokens;
+	if (options?.temperature !== undefined)
+		generationConfig.temperature = options.temperature;
+	if (options?.maxTokens !== undefined)
+		generationConfig.maxOutputTokens = options.maxTokens;
 
 	const thinking = thinkingConfigFor(model, options);
 	if (thinking) generationConfig.thinkingConfig = thinking;
@@ -250,7 +303,8 @@ function buildCcaRequest(
 			request.toolConfig = { functionCallingConfig: { mode: "VALIDATED" } };
 		}
 	}
-	if (Object.keys(generationConfig).length > 0) request.generationConfig = generationConfig;
+	if (Object.keys(generationConfig).length > 0)
+		request.generationConfig = generationConfig;
 
 	if (!isAntigravity) return { project: projectId, model: model.id, request };
 
@@ -309,7 +363,9 @@ interface CcaResponseChunk {
 }
 
 /** Minimal SSE reader: yields the JSON payload of each `data:` line. */
-async function* readSseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+async function* readSseData(
+	body: ReadableStream<Uint8Array>,
+): AsyncGenerator<string> {
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
 	let buffer = "";
@@ -354,7 +410,10 @@ function isPlanningLeakPrefix(text: string): boolean {
 	return afterKey[0] === ":";
 }
 
-function splitLeadingJsonObject(text: string, ignoreQuotes: boolean): { jsonText: string; rest: string } | undefined {
+function splitLeadingJsonObject(
+	text: string,
+	ignoreQuotes: boolean,
+): { jsonText: string; rest: string } | undefined {
 	const prefixLength = text.length - text.trimStart().length;
 	const trimmed = text.slice(prefixLength);
 	if (!trimmed.startsWith("{")) return undefined;
@@ -384,19 +443,27 @@ function splitLeadingJsonObject(text: string, ignoreQuotes: boolean): { jsonText
 		if (ch === "{") depth++;
 		else if (ch === "}") {
 			depth--;
-			if (depth === 0) return { jsonText: trimmed.slice(0, i + 1), rest: trimmed.slice(i + 1) };
+			if (depth === 0)
+				return { jsonText: trimmed.slice(0, i + 1), rest: trimmed.slice(i + 1) };
 		}
 	}
 	return undefined;
 }
 
-function isPlanningLeakObject(parsed: unknown, toolNames: Set<string>): boolean {
+function isPlanningLeakObject(
+	parsed: unknown,
+	toolNames: Set<string>,
+): boolean {
 	if (!parsed || typeof parsed !== "object") return false;
 	const record = parsed as Record<string, unknown>;
 	const hasThought = typeof record.thought === "string";
-	const isOmpTool = typeof record.call === "string" && toolNames.has(record.call);
+	const isOmpTool =
+		typeof record.call === "string" && toolNames.has(record.call);
 	const hasToolSignature =
-		"_i" in record || "paths" in record || "command" in record || ("path" in record && "content" in record);
+		"_i" in record ||
+		"paths" in record ||
+		"command" in record ||
+		("path" in record && "content" in record);
 	return hasThought || isOmpTool || hasToolSignature;
 }
 
@@ -405,22 +472,30 @@ type BufferedPlanning =
 	| { kind: "plain"; visibleText: string }
 	| { kind: "leak"; visibleText: string };
 
-function consumePlanningBuffer(text: string, toolNames: Set<string>, isFinal = false): BufferedPlanning {
+function consumePlanningBuffer(
+	text: string,
+	toolNames: Set<string>,
+	isFinal = false,
+): BufferedPlanning {
 	if (!isPlanningLeakPrefix(text)) return { kind: "plain", visibleText: text };
 
-	const leading = splitLeadingJsonObject(text, false) ?? splitLeadingJsonObject(text, true);
+	const leading =
+		splitLeadingJsonObject(text, false) ?? splitLeadingJsonObject(text, true);
 
 	if (!leading) {
 		if (isFinal) {
 			const trimmed = text.trim();
 			const hasThoughtKey = trimmed.includes('"thought"');
-			const hasToolKey = [...toolNames].some(name => trimmed.includes(`"${name}"`));
+			const hasToolKey = [...toolNames].some((name) =>
+				trimmed.includes(`"${name}"`),
+			);
 			const hasToolSignature =
 				trimmed.includes('"_i"') ||
 				trimmed.includes('"paths"') ||
 				trimmed.includes('"command"') ||
 				(trimmed.includes('"path"') && trimmed.includes('"content"'));
-			if (hasThoughtKey || hasToolKey || hasToolSignature) return { kind: "leak", visibleText: "" };
+			if (hasThoughtKey || hasToolKey || hasToolSignature)
+				return { kind: "leak", visibleText: "" };
 			return { kind: "plain", visibleText: text };
 		}
 		return { kind: "incomplete" };
@@ -431,9 +506,13 @@ function consumePlanningBuffer(text: string, toolNames: Set<string>, isFinal = f
 		parsed = JSON.parse(leading.jsonText);
 	} catch {
 		const hasThoughtKey = leading.jsonText.includes('"thought"');
-		const hasToolKey = [...toolNames].some(name => leading.jsonText.includes(`"${name}"`));
+		const hasToolKey = [...toolNames].some((name) =>
+			leading.jsonText.includes(`"${name}"`),
+		);
 		const isLeak = hasThoughtKey || hasToolKey;
-		return isLeak ? { kind: "leak", visibleText: leading.rest } : { kind: "plain", visibleText: text };
+		return isLeak
+			? { kind: "leak", visibleText: leading.rest }
+			: { kind: "plain", visibleText: text };
 	}
 
 	return isPlanningLeakObject(parsed, toolNames)
@@ -453,7 +532,9 @@ interface ParsedCredential {
 
 function parseStoredCredential(apiKey: string | undefined): ParsedCredential {
 	if (!apiKey) {
-		throw new Error("google provider is set up for Google OAuth (Cloud Code Assist). Run /login google to authenticate.");
+		throw new Error(
+			"google provider is set up for Google OAuth (Cloud Code Assist). Run /login google to authenticate.",
+		);
 	}
 	// The oauth getApiKey hook serializes {token, projectId, variant}; anything
 	// else (e.g. a leftover AI Studio key) cannot drive the CCA protocol.
@@ -502,16 +583,27 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
-async function doFetchWithRetry(url: string, init: RequestInit, options?: SimpleStreamOptions): Promise<Response> {
+async function doFetchWithRetry(
+	url: string,
+	init: RequestInit,
+	options?: SimpleStreamOptions,
+): Promise<Response> {
 	const fetchImpl = options?.fetch ?? fetch;
 	let lastError: unknown;
 	for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-		if (attempt > 0) await sleep(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), options?.signal);
+		if (attempt > 0)
+			await sleep(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), options?.signal);
 		try {
 			const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-			const signal = options?.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+			const signal = options?.signal
+				? AbortSignal.any([options.signal, timeoutSignal])
+				: timeoutSignal;
 			const response = await fetchImpl(url, { ...init, signal });
-			if (!response.ok && isRetriableStatus(response.status) && attempt < MAX_RETRIES) {
+			if (
+				!response.ok &&
+				isRetriableStatus(response.status) &&
+				attempt < MAX_RETRIES
+			) {
 				lastError = new Error(`HTTP ${response.status}`);
 				continue;
 			}
@@ -525,48 +617,10 @@ async function doFetchWithRetry(url: string, init: RequestInit, options?: Simple
 	throw lastError;
 }
 
-async function isHeadroomProxyRunning(host: string, port: number): Promise<boolean> {
-	try {
-		const res = await fetch(`http://${host}:${port}/health`, {
-			signal: AbortSignal.timeout(1500),
-		});
-		return res.ok;
-	} catch {
-		return false;
-	}
-}
-
-async function resolveStreamingEndpoints(
-	config: GoogleCcaConfig,
-	isAntigravity: boolean,
-): Promise<string[]> {
-	const baseGoogleEndpoints = isAntigravity
-		? ANTIGRAVITY_ENDPOINTS
-		: [GEMINI_CLI_ENDPOINT];
-
-	if (config.headroom) {
-		const proxyAlive = await isHeadroomProxyRunning(
-			config.headroomHost,
-			config.headroomPort,
-		);
-		if (proxyAlive) {
-			return [
-				`http://${config.headroomHost}:${config.headroomPort}`,
-				...baseGoogleEndpoints,
-			];
-		}
-	}
-
-	return baseGoogleEndpoints;
-}
-
-let activeCcaConfig: GoogleCcaConfig = loadCcaConfig(process.cwd());
-
 function streamGoogleCca(
 	model: Model<Api>,
 	context: Context,
 	options?: SimpleStreamOptions,
-	config: GoogleCcaConfig = activeCcaConfig,
 ): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 
@@ -593,8 +647,16 @@ function streamGoogleCca(
 		try {
 			const credential = parseStoredCredential(options?.apiKey);
 			const isAntigravity = credential.variant === "antigravity";
-			const endpoints = await resolveStreamingEndpoints(config, isAntigravity);
-			const body = JSON.stringify(buildCcaRequest(model, context, credential.projectId, options, isAntigravity));
+			const endpoints = isAntigravity ? ANTIGRAVITY_ENDPOINTS : [GEMINI_CLI_ENDPOINT];
+			const body = JSON.stringify(
+				buildCcaRequest(
+					model,
+					context,
+					credential.projectId,
+					options,
+					isAntigravity,
+				),
+			);
 			const headers = {
 				Authorization: `Bearer ${credential.token}`,
 				"Content-Type": "application/json",
@@ -603,12 +665,13 @@ function streamGoogleCca(
 					? { "User-Agent": antigravityUserAgent() }
 					: {
 							"User-Agent": geminiCliUserAgent(model.id),
-							"Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+							"Client-Metadata":
+								"ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
 						}),
 				...(options?.headers ?? {}),
 			};
 
-			const toolNames = new Set(context.tools?.map(t => t.name) ?? []);
+			const toolNames = new Set(context.tools?.map((t) => t.name) ?? []);
 			const isLeakModel = model.id.includes("flash");
 			let started = false;
 			let firstTokenTime: number | undefined;
@@ -635,7 +698,8 @@ function streamGoogleCca(
 
 			/** Consume one SSE response into `output`. Returns true when content arrived. */
 			const consumeResponse = async (response: Response): Promise<boolean> => {
-				if (!response.body) throw new Error("Cloud Code Assist: empty response body");
+				if (!response.body)
+					throw new Error("Cloud Code Assist: empty response body");
 
 				let currentBlock:
 					| { type: "text"; text: string; textSignature?: string }
@@ -653,7 +717,12 @@ function streamGoogleCca(
 				const endCurrentBlock = () => {
 					if (!currentBlock) return;
 					if (currentBlock.type === "text") {
-						stream.push({ type: "text_end", contentIndex: blockIndex(), content: currentBlock.text, partial: output });
+						stream.push({
+							type: "text_end",
+							contentIndex: blockIndex(),
+							content: currentBlock.text,
+							partial: output,
+						});
 					} else {
 						stream.push({
 							type: "thinking_end",
@@ -670,17 +739,29 @@ function streamGoogleCca(
 						currentBlock = { type: "text", text: "" };
 						blocks.push(currentBlock);
 						ensureStarted();
-						stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
+						stream.push({
+							type: "text_start",
+							contentIndex: blockIndex(),
+							partial: output,
+						});
 					}
 					return currentBlock;
 				};
 				const startThinkingBlock = () => {
 					if (currentBlock?.type !== "thinking") {
 						endCurrentBlock();
-						currentBlock = { type: "thinking", thinking: "", thinkingSignature: undefined };
+						currentBlock = {
+							type: "thinking",
+							thinking: "",
+							thinkingSignature: undefined,
+						};
 						blocks.push(currentBlock);
 						ensureStarted();
-						stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
+						stream.push({
+							type: "thinking_start",
+							contentIndex: blockIndex(),
+							partial: output,
+						});
 					}
 					return currentBlock;
 				};
@@ -688,13 +769,22 @@ function streamGoogleCca(
 					if (!delta) return;
 					const block = startTextBlock();
 					block.text += delta;
-					block.textSignature = retainThoughtSignature(block.textSignature, signature);
-					stream.push({ type: "text_delta", contentIndex: blockIndex(), delta, partial: output });
+					block.textSignature = retainThoughtSignature(
+						block.textSignature,
+						signature,
+					);
+					stream.push({
+						type: "text_delta",
+						contentIndex: blockIndex(),
+						delta,
+						partial: output,
+					});
 				};
 				const flushLeakBuffer = () => {
 					if (!isBuffering) return;
 					const buffered = consumePlanningBuffer(textBuffer, toolNames, true);
-					if (buffered.kind !== "incomplete") emitText(buffered.visibleText, bufferedSignature);
+					if (buffered.kind !== "incomplete")
+						emitText(buffered.visibleText, bufferedSignature);
 					isBuffering = false;
 					textBuffer = "";
 					bufferedSignature = undefined;
@@ -709,14 +799,18 @@ function streamGoogleCca(
 					}
 
 					if (chunk.error) {
-						const detail = chunk.error.message || chunk.error.status || "unknown error";
+						const detail =
+							chunk.error.message || chunk.error.status || "unknown error";
 						throw new Error(`Cloud Code Assist stream error: ${detail}`);
 					}
 					const responseData = chunk.response;
 					if (!responseData) continue;
 					if (responseData.responseId) lastResponseId = responseData.responseId;
 
-					if (!responseData.candidates?.length && responseData.promptFeedback?.blockReason) {
+					if (
+						!responseData.candidates?.length &&
+						responseData.promptFeedback?.blockReason
+					) {
 						const detail = responseData.promptFeedback.blockReasonMessage;
 						throw new Error(
 							`Request blocked by Google (${responseData.promptFeedback.blockReason})${detail ? `: ${detail}` : ""}`,
@@ -732,17 +826,26 @@ function streamGoogleCca(
 									flushLeakBuffer();
 									const block = startThinkingBlock();
 									block.thinking += part.text;
-									block.thinkingSignature = retainThoughtSignature(block.thinkingSignature, part.thoughtSignature);
+									block.thinkingSignature = retainThoughtSignature(
+										block.thinkingSignature,
+										part.thoughtSignature,
+									);
 									stream.push({
 										type: "thinking_delta",
 										contentIndex: blockIndex(),
 										delta: part.text,
 										partial: output,
 									});
-								} else if (isLeakModel && (isBuffering || part.text.trimStart().startsWith("{"))) {
+								} else if (
+									isLeakModel &&
+									(isBuffering || part.text.trimStart().startsWith("{"))
+								) {
 									isBuffering = true;
 									textBuffer += part.text;
-									bufferedSignature = retainThoughtSignature(bufferedSignature, part.thoughtSignature);
+									bufferedSignature = retainThoughtSignature(
+										bufferedSignature,
+										part.thoughtSignature,
+									);
 									const buffered = consumePlanningBuffer(textBuffer, toolNames);
 									if (buffered.kind !== "incomplete") {
 										isBuffering = false;
@@ -754,7 +857,11 @@ function streamGoogleCca(
 								} else {
 									emitText(part.text, part.thoughtSignature);
 								}
-							} else if (part.text === "" && part.thoughtSignature && !part.functionCall) {
+							} else if (
+								part.text === "" &&
+								part.thoughtSignature &&
+								!part.functionCall
+							) {
 								if (currentBlock?.type === "thinking") {
 									currentBlock.thinkingSignature = retainThoughtSignature(
 										currentBlock.thinkingSignature,
@@ -774,7 +881,10 @@ function streamGoogleCca(
 								sawContent = true;
 								const providedId = part.functionCall.id;
 								const needsNewId =
-									!providedId || output.content.some(b => b.type === "toolCall" && b.id === providedId);
+									!providedId ||
+									output.content.some(
+										(b) => b.type === "toolCall" && b.id === providedId,
+									);
 								const toolCallId = needsNewId
 									? `${part.functionCall.name}_${Date.now()}_${++toolCallCounter}`
 									: providedId;
@@ -783,18 +893,29 @@ function streamGoogleCca(
 									id: toolCallId,
 									name: part.functionCall.name || "",
 									arguments: part.functionCall.args ?? {},
-									...(part.thoughtSignature && { thoughtSignature: part.thoughtSignature }),
+									...(part.thoughtSignature && {
+										thoughtSignature: part.thoughtSignature,
+									}),
 								};
 								blocks.push(toolCall);
 								ensureStarted();
-								stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
+								stream.push({
+									type: "toolcall_start",
+									contentIndex: blockIndex(),
+									partial: output,
+								});
 								stream.push({
 									type: "toolcall_delta",
 									contentIndex: blockIndex(),
 									delta: JSON.stringify(toolCall.arguments),
 									partial: output,
 								});
-								stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });
+								stream.push({
+									type: "toolcall_end",
+									contentIndex: blockIndex(),
+									toolCall,
+									partial: output,
+								});
 							}
 						}
 					}
@@ -802,7 +923,10 @@ function streamGoogleCca(
 					if (candidate?.finishReason) {
 						output.rawStopReason = candidate.finishReason;
 						output.stopReason = mapStopReasonString(candidate.finishReason);
-						if (output.content.some(b => b.type === "toolCall") && output.stopReason === "stop") {
+						if (
+							output.content.some((b) => b.type === "toolCall") &&
+							output.stopReason === "stop"
+						) {
 							output.stopReason = "toolUse";
 						}
 					}
@@ -837,7 +961,11 @@ function streamGoogleCca(
 			// for eventless 200s (CCA occasionally returns empty streams).
 			const MAX_EMPTY_RETRIES = 3;
 			let succeeded = false;
-			for (let endpointIndex = 0; endpointIndex < endpoints.length && !succeeded; endpointIndex++) {
+			for (
+				let endpointIndex = 0;
+				endpointIndex < endpoints.length && !succeeded;
+				endpointIndex++
+			) {
 				const endpoint = endpoints[endpointIndex]!;
 				const isLastEndpoint = endpointIndex === endpoints.length - 1;
 				for (let attempt = 0; ; attempt++) {
@@ -864,7 +992,9 @@ function streamGoogleCca(
 							continue;
 						}
 						if (!isLastEndpoint && isRetriableStatus(response.status)) break; // next endpoint
-						throw new Error(`Cloud Code Assist API error (${response.status}): ${errorText}`);
+						throw new Error(
+							`Cloud Code Assist API error (${response.status}): ${errorText}`,
+						);
 					}
 
 					let meaningful = false;
@@ -896,17 +1026,22 @@ function streamGoogleCca(
 				);
 			}
 			if (output.stopReason === "error" || output.stopReason === "aborted") {
-				throw new Error(output.errorMessage || `Generation failed with finish reason: ${output.rawStopReason}`);
+				throw new Error(
+					output.errorMessage ||
+						`Generation failed with finish reason: ${output.rawStopReason}`,
+				);
 			}
 			if (output.content.length === 0) {
 				throw new Error("Cloud Code Assist API returned an empty response");
 			}
 
 			// SAFETY: attach extra performance timing metadata to output object
-			(output as unknown as Record<string, unknown>).duration = performance.now() - startTime;
+			(output as unknown as Record<string, unknown>).duration =
+				performance.now() - startTime;
 			if (firstTokenTime) {
 				// SAFETY: attach ttft timing metadata to output object
-				(output as unknown as Record<string, unknown>).ttft = firstTokenTime - startTime;
+				(output as unknown as Record<string, unknown>).ttft =
+					firstTokenTime - startTime;
 			}
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
@@ -914,7 +1049,8 @@ function streamGoogleCca(
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : String(error);
 			// SAFETY: attach extra performance timing metadata to output object
-			(output as unknown as Record<string, unknown>).duration = performance.now() - startTime;
+			(output as unknown as Record<string, unknown>).duration =
+				performance.now() - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -929,23 +1065,10 @@ function streamGoogleCca(
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI): void {
-	pi.on("session_start", async (_event, ctx) => {
-		activeCcaConfig = loadCcaConfig(ctx.cwd || process.cwd());
-	});
-
-	registerCcaCommands(
-		pi,
-		() => activeCcaConfig,
-		(next) => {
-			activeCcaConfig = next;
-		},
-	);
-
 	pi.registerProvider("google", {
 		name: "Google (Cloud Code Assist OAuth)",
 		api: "google-generative-ai",
-		streamSimple: (model, context, options) =>
-			streamGoogleCca(model, context, options, activeCcaConfig),
+		streamSimple: streamGoogleCca,
 		oauth: {
 			name: "Google (Cloud Code Assist)",
 			login: loginGoogle,

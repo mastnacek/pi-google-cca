@@ -23,11 +23,6 @@ are replaced.
   Generative Language API + API key. Antigravity requests carry the real hub
   client's envelope (sessionId, requestId, labels, effort-routed wire model
   ids, `VALIDATED` tool mode, fixed output caps).
-- **Headroom Context Compression Support:** Automatically routes through the local
-  Headroom proxy (`http://127.0.0.1:8787`) when enabled and available (saving 30-60% context),
-  with seamless zero-interruption fallback to direct Google endpoints if the proxy is stopped.
-- **Commands & Multi-Level Configuration:** `/cca headroom on|off [--global]` command suite with
-  lazy autocompletions and project (`.pi/google-cca.json`) / global (`~/.pi/agent/google-cca.json`) persistence.
 - Tokens refresh automatically before expiry (`oauth.refreshToken` hook); the
   grant's client variant and Cloud project id persist in
   `~/.pi/agent/auth.json`.
@@ -39,21 +34,10 @@ are replaced.
 
 ## Usage
 
-```
+```bash
 /login google        # browser OAuth; pick Antigravity or Gemini CLI client
 --provider google --model gemini-3.7-flash ...
 ```
-
-### Slash Commands (`/cca` or `/google-cca`)
-
-| Command | Description |
-| :--- | :--- |
-| `/cca headroom on` | Enable Headroom proxy routing for current session/project |
-| `/cca headroom on --global` | Enable Headroom proxy routing globally for all sessions |
-| `/cca headroom off` | Disable Headroom proxy routing (direct to Google) |
-| `/cca headroom off --global` | Disable Headroom proxy routing globally for all sessions |
-| `/cca status` | Show current routing configuration, proxy health, and account state |
-| `/cca help` | Display command reference and runtime overview |
 
 Note: after `/login google`, the stored OAuth credential replaces any AI
 Studio API key for the `google` provider, and all google-provider traffic goes
@@ -65,5 +49,3 @@ from `~/.pi/agent/auth.json` and restart pi.
 - `index.ts` — provider override (`registerProvider("google", { oauth, streamSimple })`)
 - `oauth.ts` — login/refresh flows, callback server, project discovery
 - `google-wire.ts` — message/tool converters + wire-schema normalization
-  (ported from pi-ai/omp; the extension runtime does not expose pi-ai's
-  `api/google-shared` subpath, so the converters are vendored)
