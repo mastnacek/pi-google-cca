@@ -41,6 +41,11 @@ import {
 	loginGoogle,
 	refreshGoogleToken,
 } from "./oauth.ts";
+import {
+	type GoogleCcaConfig,
+	loadCcaConfig,
+} from "./config.ts";
+import { registerCcaCommands } from "./commands.ts";
 
 const GEMINI_CLI_ENDPOINT = "https://cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_ENDPOINTS = [
@@ -520,7 +525,49 @@ async function doFetchWithRetry(url: string, init: RequestInit, options?: Simple
 	throw lastError;
 }
 
-function streamGoogleCca(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+async function isHeadroomProxyRunning(host: string, port: number): Promise<boolean> {
+	try {
+		const res = await fetch(`http://${host}:${port}/health`, {
+			signal: AbortSignal.timeout(1500),
+		});
+		return res.ok;
+	} catch {
+		return false;
+	}
+}
+
+async function resolveStreamingEndpoints(
+	config: GoogleCcaConfig,
+	isAntigravity: boolean,
+): Promise<string[]> {
+	const baseGoogleEndpoints = isAntigravity
+		? ANTIGRAVITY_ENDPOINTS
+		: [GEMINI_CLI_ENDPOINT];
+
+	if (config.headroom) {
+		const proxyAlive = await isHeadroomProxyRunning(
+			config.headroomHost,
+			config.headroomPort,
+		);
+		if (proxyAlive) {
+			return [
+				`http://${config.headroomHost}:${config.headroomPort}`,
+				...baseGoogleEndpoints,
+			];
+		}
+	}
+
+	return baseGoogleEndpoints;
+}
+
+let activeCcaConfig: GoogleCcaConfig = loadCcaConfig(process.cwd());
+
+function streamGoogleCca(
+	model: Model<Api>,
+	context: Context,
+	options?: SimpleStreamOptions,
+	config: GoogleCcaConfig = activeCcaConfig,
+): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
@@ -546,7 +593,7 @@ function streamGoogleCca(model: Model<Api>, context: Context, options?: SimpleSt
 		try {
 			const credential = parseStoredCredential(options?.apiKey);
 			const isAntigravity = credential.variant === "antigravity";
-			const endpoints = isAntigravity ? ANTIGRAVITY_ENDPOINTS : [GEMINI_CLI_ENDPOINT];
+			const endpoints = await resolveStreamingEndpoints(config, isAntigravity);
 			const body = JSON.stringify(buildCcaRequest(model, context, credential.projectId, options, isAntigravity));
 			const headers = {
 				Authorization: `Bearer ${credential.token}`,
@@ -877,10 +924,23 @@ function streamGoogleCca(model: Model<Api>, context: Context, options?: SimpleSt
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI): void {
+	pi.on("session_start", async (_event, ctx) => {
+		activeCcaConfig = loadCcaConfig(ctx.cwd || process.cwd());
+	});
+
+	registerCcaCommands(
+		pi,
+		() => activeCcaConfig,
+		(next) => {
+			activeCcaConfig = next;
+		},
+	);
+
 	pi.registerProvider("google", {
 		name: "Google (Cloud Code Assist OAuth)",
 		api: "google-generative-ai",
-		streamSimple: streamGoogleCca,
+		streamSimple: (model, context, options) =>
+			streamGoogleCca(model, context, options, activeCcaConfig),
 		oauth: {
 			name: "Google (Cloud Code Assist)",
 			login: loginGoogle,
