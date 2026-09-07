@@ -21,8 +21,8 @@
  */
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
-import { AssistantMessageEventStream, calculateCost } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, AssistantMessageEventStream, Context, Model, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
+import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import {
 	convertMessages,
 	convertTools,
@@ -568,7 +568,7 @@ function streamGoogleCca(
 	options?: SimpleStreamOptions,
 	config: GoogleCcaConfig = activeCcaConfig,
 ): AssistantMessageEventStream {
-	const stream = new AssistantMessageEventStream();
+	const stream = createAssistantMessageEventStream();
 
 	(async () => {
 		const startTime = performance.now();
@@ -902,14 +902,19 @@ function streamGoogleCca(
 				throw new Error("Cloud Code Assist API returned an empty response");
 			}
 
-			output.duration = performance.now() - startTime;
-			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+			// SAFETY: attach extra performance timing metadata to output object
+			(output as unknown as Record<string, unknown>).duration = performance.now() - startTime;
+			if (firstTokenTime) {
+				// SAFETY: attach ttft timing metadata to output object
+				(output as unknown as Record<string, unknown>).ttft = firstTokenTime - startTime;
+			}
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : String(error);
-			output.duration = performance.now() - startTime;
+			// SAFETY: attach extra performance timing metadata to output object
+			(output as unknown as Record<string, unknown>).duration = performance.now() - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
