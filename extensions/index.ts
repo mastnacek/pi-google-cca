@@ -94,30 +94,39 @@ const ANTIGRAVITY_WIRE_PROFILES: Record<
 		maxOutputTokens: 65_536,
 	},
 	"gemini-3.6-flash-low": {
+		modelEnum: "MODEL_PLACEHOLDER_M73",
 		maxOutputTokens: 65_536,
 	},
 	"gemini-3.6-flash-medium": {
+		modelEnum: "MODEL_PLACEHOLDER_M72",
 		maxOutputTokens: 65_536,
 	},
 	"gemini-3.6-flash-high": {
+		modelEnum: "MODEL_PLACEHOLDER_M71",
 		maxOutputTokens: 65_536,
 	},
 	"gemini-3.7-flash-low": {
+		modelEnum: "MODEL_PLACEHOLDER_M300",
 		maxOutputTokens: 65_536,
 	},
 	"gemini-3.7-flash-medium": {
+		modelEnum: "MODEL_PLACEHOLDER_M299",
 		maxOutputTokens: 65_536,
 	},
 	"gemini-3.7-flash-high": {
+		modelEnum: "MODEL_PLACEHOLDER_M298",
 		maxOutputTokens: 65_536,
 	},
 	"gemini-3.8-flash-low": {
+		modelEnum: "MODEL_PLACEHOLDER_M320",
 		maxOutputTokens: 65_536,
 	},
 	"gemini-3.8-flash-medium": {
+		modelEnum: "MODEL_PLACEHOLDER_M319",
 		maxOutputTokens: 65_536,
 	},
 	"gemini-3.8-flash-high": {
+		modelEnum: "MODEL_PLACEHOLDER_M318",
 		maxOutputTokens: 65_536,
 	},
 	"gemini-3.1-pro-low": {
