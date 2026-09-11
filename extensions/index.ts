@@ -93,6 +93,33 @@ const ANTIGRAVITY_WIRE_PROFILES: Record<
 		modelEnum: "MODEL_PLACEHOLDER_M132",
 		maxOutputTokens: 65_536,
 	},
+	"gemini-3.6-flash-low": {
+		maxOutputTokens: 65_536,
+	},
+	"gemini-3.6-flash-medium": {
+		maxOutputTokens: 65_536,
+	},
+	"gemini-3.6-flash-high": {
+		maxOutputTokens: 65_536,
+	},
+	"gemini-3.7-flash-low": {
+		maxOutputTokens: 65_536,
+	},
+	"gemini-3.7-flash-medium": {
+		maxOutputTokens: 65_536,
+	},
+	"gemini-3.7-flash-high": {
+		maxOutputTokens: 65_536,
+	},
+	"gemini-3.8-flash-low": {
+		maxOutputTokens: 65_536,
+	},
+	"gemini-3.8-flash-medium": {
+		maxOutputTokens: 65_536,
+	},
+	"gemini-3.8-flash-high": {
+		maxOutputTokens: 65_536,
+	},
 	"gemini-3.1-pro-low": {
 		modelEnum: "MODEL_PLACEHOLDER_M36",
 		maxOutputTokens: 65_535,
@@ -119,6 +146,13 @@ const ANTIGRAVITY_MODEL_ROUTING: Record<string, Record<string, string>> = {
 		medium: "gemini-3.5-flash-low",
 		high: "gemini-3-flash-agent",
 	},
+	"gemini-3.5-flash-lite": {
+		off: "gemini-3.5-flash-extra-low",
+		minimal: "gemini-3.5-flash-extra-low",
+		low: "gemini-3.5-flash-extra-low",
+		medium: "gemini-3.5-flash-low",
+		high: "gemini-3-flash-agent",
+	},
 	"gemini-3.6-flash": {
 		off: "gemini-3.6-flash-low",
 		minimal: "gemini-3.6-flash-low",
@@ -133,7 +167,35 @@ const ANTIGRAVITY_MODEL_ROUTING: Record<string, Record<string, string>> = {
 		medium: "gemini-3.7-flash-medium",
 		high: "gemini-3.7-flash-high",
 	},
+	"gemini-3.8-flash": {
+		off: "gemini-3.8-flash-low",
+		minimal: "gemini-3.8-flash-low",
+		low: "gemini-3.8-flash-low",
+		medium: "gemini-3.8-flash-medium",
+		high: "gemini-3.8-flash-high",
+	},
+	"gemini-flash-latest": {
+		off: "gemini-3.5-flash-extra-low",
+		minimal: "gemini-3.5-flash-extra-low",
+		low: "gemini-3.5-flash-extra-low",
+		medium: "gemini-3.5-flash-low",
+		high: "gemini-3-flash-agent",
+	},
+	"gemini-flash-lite-latest": {
+		off: "gemini-3.5-flash-extra-low",
+		minimal: "gemini-3.5-flash-extra-low",
+		low: "gemini-3.5-flash-extra-low",
+		medium: "gemini-3.5-flash-low",
+		high: "gemini-3-flash-agent",
+	},
 	"gemini-3.1-pro-preview": {
+		off: "gemini-3.1-pro-low",
+		minimal: "gemini-3.1-pro-low",
+		low: "gemini-3.1-pro-low",
+		medium: "gemini-3.1-pro-low",
+		high: "gemini-pro-agent",
+	},
+	"gemini-3.1-pro-preview-customtools": {
 		off: "gemini-3.1-pro-low",
 		minimal: "gemini-3.1-pro-low",
 		low: "gemini-3.1-pro-low",
@@ -647,7 +709,9 @@ function streamGoogleCca(
 		try {
 			const credential = parseStoredCredential(options?.apiKey);
 			const isAntigravity = credential.variant === "antigravity";
-			const endpoints = isAntigravity ? ANTIGRAVITY_ENDPOINTS : [GEMINI_CLI_ENDPOINT];
+			const endpoints = isAntigravity
+				? ANTIGRAVITY_ENDPOINTS
+				: [GEMINI_CLI_ENDPOINT];
 			const body = JSON.stringify(
 				buildCcaRequest(
 					model,
