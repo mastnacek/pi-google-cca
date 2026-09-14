@@ -222,13 +222,13 @@ export function formatQuotaStatusline(
 	if (b5h) {
 		const pct = Math.round(b5h.remainingFraction * 100);
 		const rel = b5h.resetTime ? formatRelativeTime(b5h.resetTime) : null;
-		parts.push(`5h ${pct}%${rel && pct < 100 ? ` (${rel})` : ""}`);
+		parts.push(`5h ${pct}% left${rel && pct < 100 ? ` (rst ${rel})` : ""}`);
 	}
 
 	if (bWk) {
 		const pct = Math.round(bWk.remainingFraction * 100);
 		const rel = bWk.resetTime ? formatRelativeTime(bWk.resetTime) : null;
-		parts.push(`Wk ${pct}%${rel && pct < 100 ? ` (${rel})` : ""}`);
+		parts.push(`Wk ${pct}% left${rel && pct < 100 ? ` (rst ${rel})` : ""}`);
 	}
 
 	// 2. Check 3rd-party models (Claude & GPT) if quota has been consumed
@@ -244,7 +244,7 @@ export function formatQuotaStatusline(
 		if (p3_5h && p3_5h.remainingFraction < 1) {
 			const pct = Math.round(p3_5h.remainingFraction * 100);
 			const rel = p3_5h.resetTime ? formatRelativeTime(p3_5h.resetTime) : null;
-			parts.push(`3P ${pct}%${rel ? ` (${rel})` : ""}`);
+			parts.push(`3P ${pct}% left${rel ? ` (rst ${rel})` : ""}`);
 		}
 	}
 
