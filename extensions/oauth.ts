@@ -353,12 +353,13 @@ const VARIANTS: Record<GoogleVariantId, VariantConfig> = {
 // ---------------------------------------------------------------------------
 
 class OAuthFlowError extends Error {
-	constructor(
-		message: string,
-		readonly kind: string,
-		readonly status?: number,
-	) {
+	readonly kind: string;
+	readonly status?: number;
+
+	constructor(message: string, kind: string, status?: number) {
 		super(message);
+		this.kind = kind;
+		this.status = status;
 		this.name = "OAuthFlowError";
 	}
 }

@@ -20,7 +20,11 @@
  *     the token in ~/.pi/agent/auth.json.
  */
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import type {
 	Api,
 	AssistantMessage,
@@ -52,6 +56,12 @@ import {
 	loginGoogle,
 	refreshGoogleToken,
 } from "./oauth.ts";
+import {
+	formatQuotaDetailBanner,
+	formatQuotaStatusline,
+	getAntigravityQuota,
+	invalidateQuotaCache,
+} from "./quota.ts";
 
 const GEMINI_CLI_ENDPOINT = "https://cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_ENDPOINTS = [
@@ -1059,12 +1069,20 @@ function streamGoogleCca(
 
 					if (!response.ok) {
 						const errorText = await response.text().catch(() => "");
+						if (response.status === 429) {
+							invalidateQuotaCache();
+						}
 						if (isRetriableStatus(response.status) && attempt < MAX_EMPTY_RETRIES) {
 							await sleep(RETRY_BASE_DELAY_MS * 2 ** attempt, options?.signal);
 							resetOutput();
 							continue;
 						}
 						if (!isLastEndpoint && isRetriableStatus(response.status)) break; // next endpoint
+						if (response.status === 429) {
+							throw new Error(
+								`Cloud Code Assist rate limit exceeded (HTTP 429). Check /google-quota for reset times. Upstream: ${errorText}`,
+							);
+						}
 						throw new Error(
 							`Cloud Code Assist API error (${response.status}): ${errorText}`,
 						);
@@ -1133,9 +1151,27 @@ function streamGoogleCca(
 }
 
 // ---------------------------------------------------------------------------
-// Registration: add OAuth to the built-in `google` provider. No models are
-// declared — pi's own google catalog is kept untouched.
+// Registration & Lifecycle: add OAuth to built-in `google` provider, statusline
+// quota tracking, and `/google-quota` command.
 // ---------------------------------------------------------------------------
+
+let quotaRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+async function updateQuotaStatusline(
+	ctx: ExtensionContext,
+	force = false,
+): Promise<void> {
+	if (!ctx.hasUI) return;
+	try {
+		const quota = await getAntigravityQuota(force);
+		const text = formatQuotaStatusline(quota);
+		if (text) {
+			ctx.ui.setStatus("google-cca", text);
+		}
+	} catch {
+		// Non-fatal if quota cannot be fetched
+	}
+}
 
 export default function (pi: ExtensionAPI): void {
 	pi.registerProvider("google", {
@@ -1147,6 +1183,79 @@ export default function (pi: ExtensionAPI): void {
 			login: loginGoogle,
 			refreshToken: refreshGoogleToken,
 			getApiKey: googleCredentialApiKey,
+		},
+	});
+
+	// Initialize statusline on session start and refresh every 3 minutes
+	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+		await updateQuotaStatusline(ctx);
+		if (quotaRefreshTimer) clearInterval(quotaRefreshTimer);
+		quotaRefreshTimer = setInterval(() => {
+			void updateQuotaStatusline(ctx, true);
+		}, 180_000);
+	});
+
+	// Refresh statusline after turn ends if Google provider was involved
+	pi.on("turn_end", async (_event, ctx: ExtensionContext) => {
+		if (ctx.model?.provider === "google") {
+			invalidateQuotaCache();
+			await updateQuotaStatusline(ctx, true);
+		}
+	});
+
+	// Clean up background timer on session shutdown
+	pi.on("session_shutdown", async () => {
+		if (quotaRefreshTimer) {
+			clearInterval(quotaRefreshTimer);
+			quotaRefreshTimer = null;
+		}
+	});
+
+	// Register /google-quota command
+	pi.registerCommand("google-quota", {
+		description: "Display Google Antigravity quota and window resets",
+		getArgumentCompletions: (prefix: string) => {
+			const items = [
+				{
+					value: "refresh",
+					label: "refresh",
+					description: "Force refresh quota from Google API",
+				},
+				{
+					value: "help",
+					label: "help",
+					description: "Show quota command help",
+				},
+			];
+			const clean = prefix.trim().toLowerCase();
+			const filtered = items.filter((i) => i.value.startsWith(clean));
+			return filtered.length > 0 ? filtered : null;
+		},
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const sub = args.trim().toLowerCase();
+			if (sub === "help" || sub === "-h" || sub === "--help") {
+				const help = [
+					"# /google-quota — Antigravity Quota",
+					"",
+					"Usage:",
+					"  `/google-quota`          — Show quota breakdown and window resets",
+					"  `/google-quota refresh`  — Force refresh quota and update statusline",
+					"  `/google-quota help`     — Show this help reference",
+				].join("\n");
+				ctx.ui.notify(help, "info");
+				return;
+			}
+
+			const force = sub === "refresh";
+			if (force) invalidateQuotaCache();
+
+			const quota = await getAntigravityQuota(force);
+			const banner = formatQuotaDetailBanner(quota);
+			const statusText = formatQuotaStatusline(quota);
+			if (statusText && ctx.hasUI) {
+				ctx.ui.setStatus("google-cca", statusText);
+			}
+			ctx.ui.notify(banner, "info");
 		},
 	});
 }
