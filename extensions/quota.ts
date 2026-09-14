@@ -187,6 +187,22 @@ export function formatRelativeTime(isoString?: string): string | null {
 	return `${mins}m`;
 }
 
+// ANSI colors for clean, theme-friendly terminal rendering
+export const ANSI_RESET = "\x1b[0m";
+export const ANSI_BOLD = "\x1b[1m";
+export const ANSI_GREEN = "\x1b[38;2;95;200;140m"; // Mint green (>35% remaining)
+export const ANSI_CYAN = "\x1b[38;2;95;200;230m"; // Soft cyan (title / prefix)
+export const ANSI_AMBER = "\x1b[38;2;230;200;90m"; // Warning amber/yellow (15% - 35% remaining)
+export const ANSI_RED = "\x1b[38;2;241;108;117m"; // Coral red (<15% remaining)
+export const ANSI_LAVENDER = "\x1b[38;2;170;160;220m"; // Lavender labels (5h, Wk, 3P)
+export const ANSI_DIM = "\x1b[38;2;120;124;140m"; // Dim for timers and separators
+
+function getCapacityColor(pct: number): string {
+	if (pct <= 15) return ANSI_RED;
+	if (pct <= 35) return ANSI_AMBER;
+	return ANSI_GREEN;
+}
+
 /**
  * Format compact one-line status string suitable for statusline / footer.
  * Example output:
@@ -219,16 +235,21 @@ export function formatQuotaStatusline(
 
 	const parts: string[] = [];
 
+	const formatSegment = (label: string, bucket: QuotaBucket) => {
+		const pct = Math.round(bucket.remainingFraction * 100);
+		const color = getCapacityColor(pct);
+		const rel = bucket.resetTime ? formatRelativeTime(bucket.resetTime) : null;
+		const rstPart =
+			rel && pct < 100 ? ` ${ANSI_DIM}(rst ${rel})${ANSI_RESET}` : "";
+		return `${ANSI_LAVENDER}${label}${ANSI_RESET} ${ANSI_BOLD}${color}${pct}% left${ANSI_RESET}${rstPart}`;
+	};
+
 	if (b5h) {
-		const pct = Math.round(b5h.remainingFraction * 100);
-		const rel = b5h.resetTime ? formatRelativeTime(b5h.resetTime) : null;
-		parts.push(`5h ${pct}% left${rel && pct < 100 ? ` (rst ${rel})` : ""}`);
+		parts.push(formatSegment("5h", b5h));
 	}
 
 	if (bWk) {
-		const pct = Math.round(bWk.remainingFraction * 100);
-		const rel = bWk.resetTime ? formatRelativeTime(bWk.resetTime) : null;
-		parts.push(`Wk ${pct}% left${rel && pct < 100 ? ` (rst ${rel})` : ""}`);
+		parts.push(formatSegment("Wk", bWk));
 	}
 
 	// 2. Check 3rd-party models (Claude & GPT) if quota has been consumed
@@ -242,14 +263,13 @@ export function formatQuotaStatusline(
 			(b) => b.window === "5h" || b.bucketId.includes("5h"),
 		);
 		if (p3_5h && p3_5h.remainingFraction < 1) {
-			const pct = Math.round(p3_5h.remainingFraction * 100);
-			const rel = p3_5h.resetTime ? formatRelativeTime(p3_5h.resetTime) : null;
-			parts.push(`3P ${pct}% left${rel ? ` (rst ${rel})` : ""}`);
+			parts.push(formatSegment("3P", p3_5h));
 		}
 	}
 
 	if (parts.length === 0) return null;
-	return `🪐 Antigravity: ${parts.join(" · ")}`;
+	const sep = ` ${ANSI_DIM}·${ANSI_RESET} `;
+	return `🪐 ${ANSI_BOLD}${ANSI_CYAN}Antigravity:${ANSI_RESET} ${parts.join(sep)}`;
 }
 
 /** Format detailed Markdown banner for /google-quota command. */
