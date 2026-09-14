@@ -1162,11 +1162,17 @@ async function updateQuotaStatusline(
 	force = false,
 ): Promise<void> {
 	if (!ctx.hasUI) return;
+	if (ctx.model && ctx.model.provider !== "google") {
+		ctx.ui.setStatus("google-cca", undefined);
+		return;
+	}
 	try {
 		const quota = await getAntigravityQuota(force);
 		const text = formatQuotaStatusline(quota);
 		if (text) {
 			ctx.ui.setStatus("google-cca", text);
+		} else {
+			ctx.ui.setStatus("google-cca", undefined);
 		}
 	} catch {
 		// Non-fatal if quota cannot be fetched
@@ -1201,6 +1207,13 @@ export default function (pi: ExtensionAPI): void {
 			invalidateQuotaCache();
 			await updateQuotaStatusline(ctx, true);
 		}
+	});
+
+	// React to model changes
+	pi.on("model_select", async (event, ctx: ExtensionContext) => {
+		if (event.model.provider === "google") {
+			await updateQuotaStatusline(ctx);
+		} else if (ctx.hasUI) ctx.ui.setStatus("google-cca", undefined);
 	});
 
 	// Clean up background timer on session shutdown
