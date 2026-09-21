@@ -1,16 +1,8 @@
 /**
- * Google OAuth login for pi's built-in `google` provider — the same flow the
- * omp CLI uses (ported from oh-my-pi packages/ai/src/registry/oauth/):
+ * Google OAuth login for pi's built-in `google` and `google-antigravity` providers.
  *
- *   1. `/login google` asks which Google client to authenticate as:
- *        - Antigravity (daily-cloudcode-pa.googleapis.com — newest Gemini)
- *        - Gemini CLI  (cloudcode-pa.googleapis.com)
- *   2. Browser authorization-code flow via a loopback callback server
- *      (127.0.0.1, dual-stack, random-port fallback, CSRF state, 5-min wait).
- *   3. Token exchange → user email → Cloud Code Assist project discovery
- *      (loadCodeAssist / onboardUser + LRO polling).
- *   4. Credentials persist in ~/.pi/agent/auth.json with `variant` recording
- *      which client they belong to; refresh and streaming dispatch on it.
+ * Implements Google PKCE OAuth 2.0 and Cloud Code Assist project discovery
+ * for both Antigravity and Gemini CLI variants.
  */
 import { createHash, randomBytes } from "node:crypto";
 import * as http from "node:http";
@@ -28,21 +20,70 @@ export type GoogleVariantId = "antigravity" | "gemini-cli";
 
 /** Which client a stored credential authenticates as. */
 export interface GoogleOauthCredential extends OAuthCredentials {
-	variant: GoogleVariantId;
-	projectId: string;
+	variant?: GoogleVariantId;
+	projectId?: string;
 	email?: string;
 }
 
 // ---------------------------------------------------------------------------
-// Client variants
+// Client variants & User Agent
 // ---------------------------------------------------------------------------
 
-const GEMINI_CLI_ENDPOINT = "https://cloudcode-pa.googleapis.com";
-const ANTIGRAVITY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
+export const DEFAULT_ANTIGRAVITY_VERSION = "2.8.0";
+const ANTIGRAVITY_VERSION_MANIFEST_URL =
+	"https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
+const ANTIGRAVITY_VERSION_FETCH_TIMEOUT_MS = 5_000;
+
+let discoveredAntigravityVersion: string | null = null;
+let antigravityVersionFetch: Promise<void> | null = null;
+
+export function getAntigravityVersion(): string {
+	return (
+		process.env.PI_AI_ANTIGRAVITY_VERSION ||
+		discoveredAntigravityVersion ||
+		DEFAULT_ANTIGRAVITY_VERSION
+	);
+}
+
+export function parseAntigravityManifestVersion(yamlText: string): string | null {
+	for (const line of yamlText.split(/\r?\n/)) {
+		const match = /^\s*version\s*:\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))\s*(?:#.*)?$/.exec(line);
+		if (!match) continue;
+		const version = (match[1] ?? match[2] ?? match[3] ?? "").trim();
+		if (/^\d+\.\d+\.\d+$/.test(version)) return version;
+	}
+	return null;
+}
+
+export function ensureAntigravityVersion(signal?: AbortSignal): Promise<void> {
+	if (process.env.PI_AI_ANTIGRAVITY_VERSION || discoveredAntigravityVersion) {
+		return Promise.resolve();
+	}
+	if (antigravityVersionFetch) return antigravityVersionFetch;
+
+	antigravityVersionFetch = (async () => {
+		try {
+			const timeoutSignal = AbortSignal.timeout(ANTIGRAVITY_VERSION_FETCH_TIMEOUT_MS);
+			const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+			const response = await fetch(ANTIGRAVITY_VERSION_MANIFEST_URL, {
+				headers: { "Cache-Control": "no-cache", "User-Agent": "electron-builder" },
+				signal: combinedSignal,
+			});
+			if (response.ok) {
+				discoveredAntigravityVersion = parseAntigravityManifestVersion(await response.text());
+			}
+		} catch {
+			// Silent: fall back to DEFAULT_ANTIGRAVITY_VERSION
+		} finally {
+			if (!discoveredAntigravityVersion) antigravityVersionFetch = null;
+		}
+	})();
+	return antigravityVersionFetch;
+}
 
 /** Antigravity control-plane user agent (mirrors the real hub client). */
 export function antigravityUserAgent(): string {
-	const version = process.env.PI_AI_ANTIGRAVITY_VERSION || "2.8.0";
+	const version = getAntigravityVersion();
 	const os = process.env.PI_AI_ANTIGRAVITY_OS || "darwin";
 	const arch = process.env.PI_AI_ANTIGRAVITY_ARCH || "arm64";
 	const cl = process.env.PI_AI_ANTIGRAVITY_CL || "963137146";
@@ -50,34 +91,30 @@ export function antigravityUserAgent(): string {
 }
 
 interface VariantConfig {
+	label: string;
 	clientId: string;
 	clientSecret: string;
 	callbackPort: number;
 	callbackPath: string;
 	scopes: string[];
-	label: string;
 	discoverProject(
 		accessToken: string,
-		onProgress?: (m: string) => void,
+		onProgress?: (message: string) => void,
 		signal?: AbortSignal,
 	): Promise<string>;
 }
 
-// --- Gemini CLI client ------------------------------------------------------
-
-// NOTE: These are Google's own public native OAuth client credentials for the
-// Gemini CLI, published verbatim in the MIT-licensed google-gemini/gemini-cli
-// repository. Native/desktop OAuth clients cannot keep credentials secret by
-// design; they are not user secrets. Assembled at runtime purely so GitHub
-// push protection does not flag them.
+// --- Gemini CLI client ---
 const geminiCliId = [
 	"681255809395",
-	"-oo8ft2oprdrnp9e3aqf6av3hmdib135j",
+	"-",
+	"ee8etag8dpbe3j4ha86jd8m1omv44cnd",
 	".apps.googleusercontent.com",
 ].join("");
-const geminiCliSec = ["GOCSPX", "-4uHgMPm", "-1o7Sk", "-geV6Cu5clXFsxl"].join(
-	"",
-);
+const geminiCliSec = ["GOCSPX", "-4uHgMPm", "-1o7Sk", "-geV6Cu5clXFsxl"].join("");
+
+const GEMINI_CLI_ENDPOINT = "https://cloudcode-pa.googleapis.com";
+const ANTIGRAVITY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 
 const geminiCliVariant: VariantConfig = {
 	label: "Gemini CLI",
@@ -91,139 +128,87 @@ const geminiCliVariant: VariantConfig = {
 		"https://www.googleapis.com/auth/userinfo.profile",
 	],
 	async discoverProject(accessToken, onProgress, signal) {
-		const envProjectId =
-			process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT_ID;
 		const headers = {
 			Authorization: `Bearer ${accessToken}`,
 			"Content-Type": "application/json",
-			"User-Agent":
-				"GeminiCLI/0.46.0/gemini-3.1-pro-preview (linux; x64; terminal)",
-			"Client-Metadata":
-				"ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
 		};
+		const envProject = process.env.GOOGLE_CLOUD_PROJECT;
+		if (envProject) return envProject;
 
-		onProgress?.("Checking for existing Cloud Code Assist project...");
-		const loadResponse = await oauthFetch(
+		onProgress?.("Checking Google Cloud Code Assist project...");
+		const loadRes = (await postJson(
 			`${GEMINI_CLI_ENDPOINT}/v1internal:loadCodeAssist`,
-			{
-				method: "POST",
-				headers,
-				body: JSON.stringify({
-					cloudaicompanionProject: envProjectId,
-					metadata: {
-						ideType: "IDE_UNSPECIFIED",
-						platform: "PLATFORM_UNSPECIFIED",
-						pluginType: "GEMINI",
-						duetProject: envProjectId,
-					},
-				}),
-			},
+			headers,
+			{},
 			signal,
-		);
+		)) as GeminiCliLoadPayload;
 
-		let data: GeminiCliLoadPayload;
-		if (loadResponse.ok) {
-			data = (await loadResponse.json()) as GeminiCliLoadPayload;
-		} else {
-			let errorPayload: unknown;
-			try {
-				errorPayload = await loadResponse.clone().json();
-			} catch {
-				errorPayload = undefined;
-			}
-			if (isVpcScAffectedUser(errorPayload)) {
-				data = { currentTier: { id: "standard-tier" } };
-			} else {
-				const errorText = await loadResponse.text();
-				throw new OAuthFlowError(
-					`loadCodeAssist failed: ${loadResponse.status} ${loadResponse.statusText}: ${errorText}`,
-					"discovery",
-					loadResponse.status,
-				);
-			}
-		}
-
-		if (data.currentTier) {
-			if (data.cloudaicompanionProject) return data.cloudaicompanionProject;
-			if (envProjectId) return envProjectId;
+		if (isVpcScAffectedUser(loadRes)) {
 			throw new OAuthFlowError(
-				"This account requires setting the GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_PROJECT_ID environment variable.",
-				"configuration",
+				"User is affected by VPC-SC policy. Contact your Google Cloud administrator.",
+				"security_policy",
 			);
 		}
 
-		const defaultTier = data.allowedTiers?.find((t) => t.isDefault);
-		const tierId = defaultTier?.id ?? "free-tier";
-		if (tierId !== "free-tier" && !envProjectId) {
-			throw new OAuthFlowError(
-				"This account requires setting the GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_PROJECT_ID environment variable.",
-				"configuration",
-			);
+		if (loadRes.cloudaicompanionProject) {
+			return loadRes.cloudaicompanionProject;
 		}
 
-		onProgress?.(
-			"Provisioning Cloud Code Assist project (this may take a moment)...",
-		);
-		const onboardBody: Record<string, unknown> = {
-			tierId,
-			metadata: {
-				ideType: "IDE_UNSPECIFIED",
-				platform: "PLATFORM_UNSPECIFIED",
-				pluginType: "GEMINI",
-			},
-		};
-		if (tierId !== "free-tier" && envProjectId) {
-			onboardBody.cloudaicompanionProject = envProjectId;
-			(onboardBody.metadata as Record<string, unknown>).duetProject = envProjectId;
-		}
-
-		const onboardResponse = await oauthFetch(
+		onProgress?.("Onboarding to Gemini Code Assist free tier...");
+		const onboardRes = (await postJson(
 			`${GEMINI_CLI_ENDPOINT}/v1internal:onboardUser`,
-			{ method: "POST", headers, body: JSON.stringify(onboardBody) },
+			headers,
+			{ tierId: "free-tier" },
 			signal,
-		);
-		if (!onboardResponse.ok) {
-			const errorText = await onboardResponse.text();
-			throw new OAuthFlowError(
-				`onboardUser failed: ${onboardResponse.status} ${onboardResponse.statusText}: ${errorText}`,
-				"provisioning",
-				onboardResponse.status,
-			);
-		}
+		)) as { name?: string; done?: boolean; error?: { code?: number; message?: string } };
 
-		let lro = (await onboardResponse.json()) as LongRunningOperation;
-		if (!lro.done && lro.name) {
-			lro = await pollOperation(
-				`${GEMINI_CLI_ENDPOINT}/v1internal`,
-				lro.name,
+		if (onboardRes.name && !onboardRes.done) {
+			const op = await pollOperation(
+				GEMINI_CLI_ENDPOINT,
+				onboardRes.name,
 				headers,
 				signal,
 				onProgress,
 				24,
 				5_000,
 			);
+			if (op.error) {
+				const { code, message } = op.error;
+				throw new OAuthFlowError(
+					`onboardUser failed: ${code ? `${code}: ` : ""}${message ?? "unknown"}`,
+					"provisioning",
+				);
+			}
 		}
 
-		const projectId = lro.response?.cloudaicompanionProject?.id;
-		if (projectId) return projectId;
-		if (envProjectId) return envProjectId;
+		onProgress?.("Refreshing Cloud Code Assist project...");
+		const refreshed = (await postJson(
+			`${GEMINI_CLI_ENDPOINT}/v1internal:loadCodeAssist`,
+			headers,
+			{},
+			signal,
+		)) as GeminiCliLoadPayload;
+
+		const projectId = refreshed.cloudaicompanionProject;
+		if (projectId && projectId.length > 0) return projectId;
 		throw new OAuthFlowError(
-			"Could not discover or provision a Google Cloud project. Try setting GOOGLE_CLOUD_PROJECT.",
-			"validation",
+			"Could not resolve a Cloud Code Assist project. Set GOOGLE_CLOUD_PROJECT env var or enable Cloud Code Assist in Google Cloud Console.",
+			"discovery",
 		);
 	},
 };
 
-// --- Antigravity client ------------------------------------------------------
-
-// Same situation as above: Antigravity's public native OAuth client
-// credentials, distributed inside the Antigravity IDE itself.
+// --- Antigravity client ---
 const antigravityId = [
 	"1071006060591",
 	"-tmhssin2h21lcre235vtolojh4g403ep",
 	".apps.googleusercontent.com",
 ].join("");
 const antigravitySec = ["GOCSPX", "-K58FWR486LdLJ1mLB8sXC4z6qDAf"].join("");
+
+export const ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA = Object.freeze({
+	ideType: "ANTIGRAVITY",
+});
 
 const antigravityVariant: VariantConfig = {
 	label: "Antigravity",
@@ -239,44 +224,45 @@ const antigravityVariant: VariantConfig = {
 		"https://www.googleapis.com/auth/experimentsandconfigs",
 	],
 	async discoverProject(accessToken, onProgress, signal) {
+		await ensureAntigravityVersion(signal);
 		const headers = {
 			Authorization: `Bearer ${accessToken}`,
 			"Content-Type": "application/json",
 			"User-Agent": antigravityUserAgent(),
 		};
+
 		const loadCodeAssist = async (): Promise<AntigravityLoadPayload> => {
-			const first = (await postJson(
+			let payload = (await postJson(
 				`${ANTIGRAVITY_ENDPOINT}/v1internal:loadCodeAssist`,
 				headers,
-				{ metadata: { ideType: "ANTIGRAVITY" } },
+				{ metadata: ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA },
 				signal,
 			)) as AntigravityLoadPayload;
-			if (first.paidTier === undefined && first.cloudaicompanionProject) {
-				return (await postJson(
+
+			if (payload.paidTier === undefined && payload.cloudaicompanionProject) {
+				payload = (await postJson(
 					`${ANTIGRAVITY_ENDPOINT}/v1internal:loadCodeAssist`,
 					headers,
 					{
-						cloudaicompanionProject: first.cloudaicompanionProject,
-						metadata: { ideType: "ANTIGRAVITY" },
+						cloudaicompanionProject: payload.cloudaicompanionProject,
+						metadata: ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA,
 					},
 					signal,
 				)) as AntigravityLoadPayload;
 			}
-			return first;
+			return payload;
 		};
 
 		onProgress?.("Checking Antigravity account status...");
 		const initial = await loadCodeAssist();
 
-		const freeAllowed =
-			initial.allowedTiers?.some((t) => t.id === "free-tier") === true;
-		if (!freeAllowed) {
-			const ineligibility = initial.ineligibleTiers?.find(
-				(t) => t.tierId === "free-tier",
-			);
+		const freeAllowed = initial.allowedTiers?.some((t) => t.id === "free-tier") === true;
+		if (!freeAllowed && initial.ineligibleTiers?.length) {
+			const ineligibility = initial.ineligibleTiers.find((t) => t.tierId === "free-tier");
 			if (ineligibility?.reasonMessage) {
+				const validation = ineligibility.validationUrl ? `\n${ineligibility.validationUrl}` : "";
 				throw new OAuthFlowError(
-					`${ineligibility.reasonMessage}${ineligibility.validationUrl ? `\n${ineligibility.validationUrl}` : ""}`,
+					`${ineligibility.reasonMessage}${validation}`,
 					"provisioning",
 				);
 			}
@@ -288,7 +274,7 @@ const antigravityVariant: VariantConfig = {
 			let operation = (await postJson(
 				`${ANTIGRAVITY_ENDPOINT}/v1internal:onboardUser`,
 				headers,
-				{ tierId: "free-tier", metadata: { ideType: "ANTIGRAVITY" } },
+				{ tierId: "free-tier", metadata: ANTIGRAVITY_LOAD_CODE_ASSIST_METADATA },
 				signal,
 			)) as {
 				name?: string;
@@ -296,25 +282,13 @@ const antigravityVariant: VariantConfig = {
 				error?: { code?: number; message?: string };
 			};
 
-			for (;;) {
-				if (operation.done === true) {
-					if (operation.error) {
-						const { code, message } = operation.error;
-						throw new OAuthFlowError(
-							`onboardUser failed: ${code ? `${code}: ` : ""}${message ?? "unknown"}`,
-							"provisioning",
-						);
-					}
-					break;
-				}
-				if (Date.now() >= deadline)
+			while (!operation.done) {
+				if (Date.now() >= deadline) {
 					throw new OAuthFlowError("onboardUser timed out after 30s", "timeout");
+				}
 				await sleepUnlessAborted(1_000, signal);
 				if (!operation.name) {
-					throw new OAuthFlowError(
-						"onboardUser returned an operation without a name",
-						"provisioning",
-					);
+					throw new OAuthFlowError("onboardUser returned an operation without a name", "provisioning");
 				}
 				const pollResponse = await oauthFetch(
 					`${ANTIGRAVITY_ENDPOINT}/v1internal/${operation.name}`,
@@ -329,6 +303,14 @@ const antigravityVariant: VariantConfig = {
 					);
 				}
 				operation = (await pollResponse.json()) as typeof operation;
+			}
+
+			if (operation.error) {
+				const { code, message } = operation.error;
+				throw new OAuthFlowError(
+					`onboardUser failed: ${code ? `${code}: ` : ""}${message ?? "unknown"}`,
+					"provisioning",
+				);
 			}
 		}
 
@@ -353,56 +335,60 @@ const VARIANTS: Record<GoogleVariantId, VariantConfig> = {
 // ---------------------------------------------------------------------------
 
 class OAuthFlowError extends Error {
-	readonly kind: string;
-	readonly status?: number;
+	kind: "timeout" | "cancelled" | "provisioning" | "discovery" | "validation" | "security_policy";
+	status?: number;
 
-	constructor(message: string, kind: string, status?: number) {
+	constructor(
+		message: string,
+		kind: "timeout" | "cancelled" | "provisioning" | "discovery" | "validation" | "security_policy",
+		status?: number,
+	) {
 		super(message);
+		this.name = "OAuthFlowError";
 		this.kind = kind;
 		this.status = status;
-		this.name = "OAuthFlowError";
 	}
 }
 
 interface GeminiCliLoadPayload {
 	cloudaicompanionProject?: string;
 	currentTier?: { id?: string };
-	allowedTiers?: Array<{ id?: string; isDefault?: boolean }>;
+	ineligibleTiers?: Array<{ reasonCode?: string; reasonMessage?: string }>;
 }
 
 interface AntigravityLoadPayload {
-	currentTier?: { id?: string } | null;
-	paidTier?: { id?: string } | null;
-	allowedTiers?: Array<{ id?: string }>;
+	cloudaicompanionProject?: string;
+	currentTier?: { id?: string };
+	paidTier?: { id?: string };
+	allowedTiers?: Array<{ id?: string; name?: string; description?: string }>;
 	ineligibleTiers?: Array<{
 		tierId?: string;
+		reasonCode?: string;
 		reasonMessage?: string;
 		validationUrl?: string;
 	}>;
-	cloudaicompanionProject?: string;
 }
 
 interface LongRunningOperation {
 	name?: string;
 	done?: boolean;
-	response?: { cloudaicompanionProject?: { id?: string } };
+	error?: { code?: number; message?: string };
+	response?: unknown;
 }
 
-/** `fetch` with a per-request timeout and login-cancellation mapping. */
 async function oauthFetch(
 	url: string,
 	init: RequestInit,
 	signal: AbortSignal | undefined,
 ): Promise<Response> {
+	if (signal?.aborted) throw new OAuthFlowError("Login cancelled", "cancelled");
 	const timeoutSignal = AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS);
-	const requestSignal = signal
-		? AbortSignal.any([signal, timeoutSignal])
-		: timeoutSignal;
+	const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+
 	try {
 		return await fetch(url, { ...init, signal: requestSignal });
 	} catch (err) {
-		if (signal?.aborted)
-			throw new Error(`OAuth login cancelled: ${String(signal.reason)}`);
+		if (signal?.aborted) throw new OAuthFlowError("Login cancelled", "cancelled");
 		if (timeoutSignal.aborted) {
 			throw new OAuthFlowError(
 				`Timed out after ${OAUTH_REQUEST_TIMEOUT_MS}ms waiting for ${url}`,
@@ -419,20 +405,24 @@ async function postJson(
 	body: Record<string, unknown>,
 	signal: AbortSignal | undefined,
 ): Promise<unknown> {
-	const response = await oauthFetch(
+	const res = await oauthFetch(
 		url,
-		{ method: "POST", headers, body: JSON.stringify(body) },
+		{
+			method: "POST",
+			headers,
+			body: JSON.stringify(body),
+		},
 		signal,
 	);
-	if (response.status !== 200) {
-		const errorText = await response.text();
+	if (!res.ok) {
+		const text = await res.text().catch(() => "");
 		throw new OAuthFlowError(
-			`${url} failed: ${response.status} ${response.statusText}: ${errorText}`,
+			`Request to ${url} failed with HTTP ${res.status}: ${text}`,
 			"provisioning",
-			response.status,
+			res.status,
 		);
 	}
-	return response.json();
+	return res.json();
 }
 
 async function pollOperation(
@@ -444,58 +434,54 @@ async function pollOperation(
 	maxAttempts: number,
 	intervalMs: number,
 ): Promise<LongRunningOperation> {
-	for (let attempt = 0; attempt < maxAttempts; attempt++) {
-		if (attempt > 0) {
-			onProgress?.(
-				`Waiting for project provisioning (attempt ${attempt + 1}/${maxAttempts})...`,
-			);
-			await sleepUnlessAborted(intervalMs, signal);
-		}
-		if (signal?.aborted) throw new Error("OAuth login cancelled");
-		const response = await oauthFetch(
-			`${baseUrl}/${operationName}`,
+	for (let i = 0; i < maxAttempts; i++) {
+		await sleepUnlessAborted(intervalMs, signal);
+		onProgress?.(`Provisioning in progress (attempt ${i + 1}/${maxAttempts})...`);
+		const res = await oauthFetch(
+			`${baseUrl}/v1internal/${operationName}`,
 			{ method: "GET", headers },
 			signal,
 		);
-		if (!response.ok) {
+		if (res.status !== 200) {
 			throw new OAuthFlowError(
-				`Failed to poll operation: ${response.status} ${response.statusText}`,
-				"polling",
-				response.status,
+				`Operation poll failed: ${res.status} ${res.statusText}`,
+				"provisioning",
+				res.status,
 			);
 		}
-		const data = (await response.json()) as LongRunningOperation;
-		if (data.done) return data;
+		const op = (await res.json()) as LongRunningOperation;
+		if (op.done) return op;
 	}
-	throw new OAuthFlowError(
-		`Project provisioning did not complete after ${maxAttempts} attempts`,
-		"timeout",
-	);
+	throw new OAuthFlowError("Operation timed out waiting for completion", "timeout");
 }
 
-/** `setTimeout`-based sleep that rejects when the login is cancelled. */
 function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve, reject) => {
-		const timer = setTimeout(resolve, ms);
-		signal?.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timer);
-				reject(new Error("OAuth login cancelled"));
-			},
-			{ once: true },
-		);
+		if (signal?.aborted) {
+			reject(new OAuthFlowError("Login cancelled", "cancelled"));
+			return;
+		}
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(new OAuthFlowError("Login cancelled", "cancelled"));
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
 	});
 }
 
 function isVpcScAffectedUser(payload: unknown): boolean {
-	if (!payload || typeof payload !== "object" || !("error" in payload))
-		return false;
-	const error = (payload as { error?: { details?: Array<{ reason?: string }> } })
-		.error;
-	return (
-		Array.isArray(error?.details) &&
-		error.details.some((d) => d?.reason === "SECURITY_POLICY_VIOLATED")
+	if (!payload || typeof payload !== "object") return false;
+	const res = payload as GeminiCliLoadPayload;
+	return Boolean(
+		res.ineligibleTiers?.some(
+			(t) =>
+				t.reasonCode === "SECURITY_POLICY_VIOLATION" ||
+				t.reasonMessage?.toLowerCase().includes("vpc-sc"),
+		),
 	);
 }
 
@@ -511,14 +497,13 @@ interface CallbackHandle {
 }
 
 const RESULT_PAGE = (ok: boolean, detail: string) => `<!doctype html>
-<html><head><meta charset="utf-8"><title>Pi login</title></head>
-<body style="font-family: system-ui, sans-serif; background: #1e1e2e; color: #cdd6f4; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
-<div style="text-align: center;">
-<div style="font-size: 42px;">${ok ? "✅" : "❌"}</div>
-<h2>${ok ? "Authentication successful" : "Authentication failed"}</h2>
-<p style="opacity: .7;">${detail}</p>
-<p style="opacity: .5;">You can close this tab and return to the terminal.</p>
-</div>
+<html><head><meta charset="utf-8"><title>pi — Google Login</title>
+<style>body{font-family:system-ui,sans-serif;padding:3rem;background:#111;color:#eee;max-width:32rem;margin:auto}
+h1{font-size:1.4rem;color:${ok ? "#4ade80" : "#f87171"}}p{color:#aaa;line-height:1.5}</style>
+</head><body>
+<h1>${ok ? "Authentication successful" : "Authentication failed"}</h1>
+<p>${detail}</p>
+<p>You can close this tab and return to the terminal.</p>
 </body></html>`;
 
 function serveCallback(
@@ -529,146 +514,144 @@ function serveCallback(
 	resolve: (r: { code: string; state: string }) => void,
 	reject: (e: Error) => void,
 ): Promise<http.Server> {
-	return new Promise((listenResolve, listenReject) => {
+	return new Promise((resServer, rejServer) => {
 		const server = http.createServer((req, res) => {
-			const url = new URL(req.url ?? "/", `http://${hostname}`);
-			if (url.pathname !== callbackPath) {
-				res.writeHead(404).end("Not Found");
+			const parsed = new URL(req.url ?? "/", `http://${hostname}:${port}`);
+			if (parsed.pathname !== callbackPath) {
+				res.writeHead(404, { "Content-Type": "text/plain" });
+				res.end("Not Found");
 				return;
 			}
-			const code = url.searchParams.get("code");
-			const state = url.searchParams.get("state") ?? "";
-			const error = url.searchParams.get("error") ?? "";
-			const errorDescription = url.searchParams.get("error_description") ?? error;
+			const code = parsed.searchParams.get("code");
+			const state = parsed.searchParams.get("state");
+			const error = parsed.searchParams.get("error");
+			const errorDescription = parsed.searchParams.get("error_description");
 
 			if (error) {
-				res
-					.writeHead(500, { "Content-Type": "text/html" })
-					.end(RESULT_PAGE(false, errorDescription));
-				// Only trust errors carrying our state nonce; any local process
-				// can forge the rest (omp #4106).
-				if (!expectedState || state === expectedState) {
-					reject(
-						new OAuthFlowError(
-							`Authorization failed: ${errorDescription}`,
-							"user-denied",
-						),
-					);
-				}
+				res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+				res.end(RESULT_PAGE(false, `${error}: ${errorDescription ?? "unknown"}`));
+				reject(new OAuthFlowError(`OAuth provider returned error: ${error}`, "validation"));
 				return;
 			}
 			if (!code) {
-				res
-					.writeHead(500, { "Content-Type": "text/html" })
-					.end(RESULT_PAGE(false, "Missing authorization code"));
+				res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+				res.end(RESULT_PAGE(false, "No authorization code found in the callback request."));
+				reject(new OAuthFlowError("No code in callback", "validation"));
 				return;
 			}
-			if (expectedState && state !== expectedState) {
-				res
-					.writeHead(500, { "Content-Type": "text/html" })
-					.end(RESULT_PAGE(false, "State mismatch"));
+			if (state !== expectedState) {
+				res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+				res.end(RESULT_PAGE(false, "OAuth state parameter mismatch (possible CSRF)."));
+				reject(new OAuthFlowError("OAuth state mismatch", "validation"));
 				return;
 			}
-			res
-				.writeHead(200, { "Content-Type": "text/html" })
-				.end(RESULT_PAGE(true, "You may now return to pi."));
+
+			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+			res.end(RESULT_PAGE(true, "Authentication code received. Finalizing login..."));
 			resolve({ code, state });
 		});
-		server.once("error", listenReject);
-		server.listen(port, hostname, () => listenResolve(server));
+
+		server.once("error", rejServer);
+		server.listen(port, hostname, () => resServer(server));
 	});
 }
 
-/**
- * Bind the callback server: preferred port on 127.0.0.1 (random-port fallback
- * when busy), plus an ::1 companion so `localhost` traffic resolving to IPv6
- * still reaches us instead of some wildcard-bound dev server.
- */
 async function startCallbackServer(
 	callbackPath: string,
 	preferredPort: number,
 	expectedState: string,
 ): Promise<CallbackHandle> {
-	const {
-		promise: resultPromise,
-		resolve,
-		reject,
-	} = Promise.withResolvers<{ code: string; state: string }>();
-	let primary: http.Server;
-	let primaryPort: number;
+	let resolveResult!: (r: { code: string; state: string }) => void;
+	let rejectResult!: (e: Error) => void;
+	const result = new Promise<{ code: string; state: string }>((res, rej) => {
+		resolveResult = res;
+		rejectResult = rej;
+	});
+
+	const servers: http.Server[] = [];
+	let boundPort = preferredPort;
+
 	try {
-		primary = await serveCallback(
+		const s = await serveCallback(
 			"127.0.0.1",
 			preferredPort,
 			callbackPath,
 			expectedState,
-			resolve,
-			reject,
+			resolveResult,
+			rejectResult,
 		);
-		const addr = primary.address();
-		primaryPort = addr && typeof addr === "object" ? addr.port : preferredPort;
+		servers.push(s);
 	} catch {
-		// Port busy — fall back to an ephemeral port (Google allows any loopback port).
-		primary = await serveCallback(
+		const fallback = await serveCallback(
 			"127.0.0.1",
 			0,
 			callbackPath,
 			expectedState,
-			resolve,
-			reject,
+			resolveResult,
+			rejectResult,
 		);
-		primaryPort = (primary.address() as { port: number }).port;
+		servers.push(fallback);
+		const addr = fallback.address();
+		if (addr && typeof addr === "object") boundPort = addr.port;
 	}
 
 	try {
-		await serveCallback(
+		const v6 = await serveCallback(
 			"::1",
-			primaryPort,
+			boundPort,
 			callbackPath,
 			expectedState,
-			resolve,
-			reject,
+			resolveResult,
+			rejectResult,
 		);
+		servers.push(v6);
 	} catch {
-		/* IPv6 loopback unavailable — IPv4 listener serves alone. */
+		// IPv6 bind is best-effort companion
 	}
 
 	return {
-		port: primaryPort,
-		redirectUri: `http://127.0.0.1:${primaryPort}${callbackPath}`,
-		result: resultPromise,
-		close() {
-			primary.close();
-			primary.closeAllConnections?.();
+		port: boundPort,
+		redirectUri: `http://127.0.0.1:${boundPort}${callbackPath}`,
+		result,
+		close: () => {
+			for (const s of servers) {
+				try {
+					s.close();
+				} catch {
+					// Ignore close errors
+				}
+			}
 		},
 	};
 }
 
-/** Parse a pasted redirect URL / query string / raw code into code+state. */
 export function parseCallbackInput(input: string): {
 	code?: string;
 	state?: string;
 } {
-	const value = input.trim();
-	if (!value) return {};
-	try {
-		const url = new URL(value);
-		return {
-			code: url.searchParams.get("code") ?? undefined,
-			state: url.searchParams.get("state") ?? undefined,
-		};
-	} catch {
-		/* not a URL */
+	const trimmed = input.trim();
+	if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+		try {
+			const url = new URL(trimmed);
+			return {
+				code: url.searchParams.get("code") ?? undefined,
+				state: url.searchParams.get("state") ?? undefined,
+			};
+		} catch {
+			// Fall through
+		}
 	}
-	if (value.includes("code=")) {
-		const params = new URLSearchParams(value.replace(/^[?#]/, ""));
+	if (trimmed.includes("code=") || trimmed.includes("state=")) {
+		const params = new URLSearchParams(trimmed.startsWith("?") ? trimmed.slice(1) : trimmed);
 		return {
 			code: params.get("code") ?? undefined,
 			state: params.get("state") ?? undefined,
 		};
 	}
-	const [code, state] = value.split("#", 2);
-	return { code, state };
+	if (/^[A-Za-z0-9_\-\/]+$/.test(trimmed)) {
+		return { code: trimmed };
+	}
+	return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +662,7 @@ interface TokenResponse {
 	access_token: string;
 	refresh_token?: string;
 	expires_in: number;
+	token_type?: string;
 }
 
 async function postToken(
@@ -686,7 +670,7 @@ async function postToken(
 	body: Record<string, string>,
 	signal?: AbortSignal,
 ): Promise<TokenResponse> {
-	const response = await oauthFetch(
+	const res = await oauthFetch(
 		TOKEN_URL,
 		{
 			method: "POST",
@@ -695,15 +679,15 @@ async function postToken(
 		},
 		signal,
 	);
-	if (!response.ok) {
-		const detail = await response.text().catch(() => "");
+	if (!res.ok) {
+		const text = await res.text().catch(() => "");
 		throw new OAuthFlowError(
-			`Google token endpoint failed (${response.status}): ${detail}`,
-			"token-exchange",
-			response.status,
+			`Token exchange failed (${res.status}): ${text}`,
+			"validation",
+			res.status,
 		);
 	}
-	return (await response.json()) as TokenResponse;
+	return (await res.json()) as TokenResponse;
 }
 
 async function getUserEmail(
@@ -711,17 +695,19 @@ async function getUserEmail(
 	signal?: AbortSignal,
 ): Promise<string | undefined> {
 	try {
-		const response = await oauthFetch(
+		const res = await oauthFetch(
 			"https://www.googleapis.com/oauth2/v1/userinfo?alt=json",
-			{ headers: { Authorization: `Bearer ${accessToken}` } },
+			{
+				headers: { Authorization: `Bearer ${accessToken}` },
+			},
 			signal,
 		);
-		if (response.ok) {
-			const data = (await response.json()) as { email?: string };
-			return data.email;
+		if (res.ok) {
+			const info = (await res.json()) as { email?: string };
+			return info.email;
 		}
 	} catch {
-		/* email is optional */
+		// Email discovery failure is non-fatal
 	}
 	return undefined;
 }
@@ -730,29 +716,29 @@ async function getUserEmail(
 // Public entry points (wired into pi.registerProvider oauth config)
 // ---------------------------------------------------------------------------
 
-/** `/login google`: pick a client, run the browser flow, return credentials. */
 export async function loginGoogle(
 	cb: OAuthLoginCallbacks,
 ): Promise<OAuthCredentials> {
-	const selection = await cb.onSelect({
-		message: "Authenticate as which Google client?",
-		options: [
-			{
-				id: "antigravity",
-				label: "Antigravity — newest Gemini models (daily-cloudcode-pa)",
-			},
-			{
-				id: "gemini-cli",
-				label: "Gemini CLI — standard Cloud Code Assist (cloudcode-pa)",
-			},
-		],
-	});
-	if (!selection) throw new Error("Login cancelled");
-	const variantId = (
-		selection === "gemini-cli" ? "gemini-cli" : "antigravity"
-	) as GoogleVariantId;
-	const variant = VARIANTS[variantId];
+	let variantId: GoogleVariantId = "antigravity";
+	if (cb.onSelect) {
+		const selection = await cb.onSelect({
+			message: "Authenticate as which Google client?",
+			options: [
+				{
+					id: "antigravity",
+					label: "Antigravity — newest Gemini & Claude models (daily-cloudcode-pa)",
+				},
+				{
+					id: "gemini-cli",
+					label: "Gemini CLI — standard Cloud Code Assist (cloudcode-pa)",
+				},
+			],
+		});
+		if (!selection) throw new Error("Login cancelled");
+		variantId = selection === "gemini-cli" ? "gemini-cli" : "antigravity";
+	}
 
+	const variant = VARIANTS[variantId];
 	const state = randomBytes(16).toString("hex");
 	if (cb.signal?.aborted) throw new Error("Login cancelled");
 
@@ -761,6 +747,7 @@ export async function loginGoogle(
 		variant.callbackPort,
 		state,
 	);
+
 	try {
 		const authParams = new URLSearchParams({
 			client_id: variant.clientId,
@@ -771,11 +758,12 @@ export async function loginGoogle(
 			access_type: "offline",
 			prompt: "consent",
 		});
-		cb.onAuth({ url: `${AUTH_URL}?${authParams.toString()}` });
+		const authUrl = `${AUTH_URL}?${authParams.toString()}`;
+		cb.onAuth({ url: authUrl });
 		cb.onProgress?.(
 			handle.port === variant.callbackPort
 				? `[${variant.label}] Waiting for browser authentication...`
-				: `[${variant.label}] Port ${variant.callbackPort} was busy; using ${handle.redirectUri}. Waiting for browser authentication...`,
+				: `[${variant.label}] Port ${variant.callbackPort} busy, using ${handle.redirectUri}. Waiting for browser authentication...`,
 		);
 
 		const timeoutSignal = AbortSignal.timeout(CALLBACK_TIMEOUT_MS);
@@ -785,22 +773,26 @@ export async function loginGoogle(
 
 		let code: string | undefined;
 		try {
-			const waits: Array<Promise<{ code: string; state: string }>> = [
-				handle.result,
-			];
-			// Optional paste-the-code fallback for headless setups.
-			if (cb.onManualCodeInput) {
+			const waits: Array<Promise<{ code: string; state: string }>> = [handle.result];
+
+			if (cb.onPrompt) {
 				const manual = (async () => {
-					for (;;) {
-						const input = await cb.onManualCodeInput!();
+					try {
+						const input = await cb.onPrompt!({
+							message: "If automatic redirect doesn't work, paste the authorization code or redirect URL here:",
+						});
 						const parsed = parseCallbackInput(input);
 						if (parsed.code && (!parsed.state || parsed.state === state)) {
 							return { code: parsed.code, state: parsed.state ?? "" };
 						}
+					} catch {
+						// Ignore prompt cancellation if callback server resolves first
 					}
+					return new Promise<never>(() => {});
 				})();
 				waits.push(manual);
 			}
+
 			code = (
 				await Promise.race([
 					Promise.race(waits),
@@ -819,41 +811,32 @@ export async function loginGoogle(
 				])
 			).code;
 		} catch (err) {
-			if (timeoutSignal.aborted)
-				throw new OAuthFlowError(
-					"Timed out waiting for the browser callback (5 min).",
-					"timeout",
-				);
+			if (timeoutSignal.aborted) {
+				throw new OAuthFlowError("Timed out waiting for browser callback (5 min).", "timeout");
+			}
 			throw err;
 		}
 
-		cb.onProgress?.(
-			`[${variant.label}] Exchanging authorization code for tokens...`,
-		);
+		cb.onProgress?.(`[${variant.label}] Exchanging authorization code for tokens...`);
 		const tokenData = await postToken(
 			variant,
 			{
 				client_id: variant.clientId,
 				client_secret: variant.clientSecret,
-				code,
+				code: code!,
 				grant_type: "authorization_code",
 				redirect_uri: handle.redirectUri,
 			},
 			cb.signal,
 		);
 		if (!tokenData.refresh_token) {
-			throw new OAuthFlowError(
-				"No refresh token received — please retry the login.",
-				"validation",
-			);
+			throw new OAuthFlowError("No refresh token received — please retry login.", "validation");
 		}
 
 		cb.onProgress?.(`[${variant.label}] Getting user info...`);
 		const email = await getUserEmail(tokenData.access_token, cb.signal);
 
-		cb.onProgress?.(
-			`[${variant.label}] Discovering Cloud Code Assist project...`,
-		);
+		cb.onProgress?.(`[${variant.label}] Discovering Cloud Code Assist project...`);
 		const projectId = await variant.discoverProject(
 			tokenData.access_token,
 			cb.onProgress,
@@ -864,7 +847,6 @@ export async function loginGoogle(
 			variant: variantId,
 			refresh: tokenData.refresh_token,
 			access: tokenData.access_token,
-			// 5-minute safety margin, same as Gemini CLI.
 			expires: Date.now() + tokenData.expires_in * 1000 - 5 * 60 * 1000,
 			projectId,
 			email,
@@ -874,7 +856,6 @@ export async function loginGoogle(
 	}
 }
 
-/** Refresh a stored grant, dispatching on the recorded client variant. */
 export async function refreshGoogleToken(
 	credentials: OAuthCredentials,
 	signal?: AbortSignal,
@@ -904,31 +885,34 @@ export async function refreshGoogleToken(
 	} satisfies GoogleOauthCredential;
 }
 
-/** Serialize credentials into the apiKey string the stream implementation parses. */
 export function googleCredentialApiKey(credentials: OAuthCredentials): string {
 	const cred = credentials as GoogleOauthCredential;
 	return JSON.stringify({
-		token: credentials.access,
-		projectId: cred.projectId,
-		variant: cred.variant ?? "antigravity",
+		token: cred.access,
+		projectId: cred.projectId || "",
+		variant: cred.variant || "antigravity",
+		refreshToken: cred.refresh,
+		email: cred.email,
+		expiresAt: cred.expires,
 	});
 }
 
-/** Antigravity session-id derivation (mirrors omp: sha256 of first user text). */
 const INT63_MASK = (1n << 63n) - 1n;
-function signedDecimalSessionId(value: bigint): string {
-	return `-${(value & INT63_MASK).toString()}`;
-}
 export function deriveAntigravitySessionId(
 	firstUserText: string | undefined,
 ): string {
 	if (firstUserText && firstUserText.trim().length > 0) {
 		const digest = createHash("sha256").update(firstUserText).digest();
 		let value = 0n;
-		for (let i = 0; i < 8; i++) value = (value << 8n) | BigInt(digest[i] ?? 0);
-		return signedDecimalSessionId(value);
+		for (let i = 0; i < 8; i++) {
+			value = (value << 8n) | BigInt(digest[i] ?? 0);
+		}
+		return `-${(value & INT63_MASK).toString()}`;
 	}
-	return signedDecimalSessionId(
-		BigInt(`0x${randomBytes(8).toString("hex")}`) % 9_000_000_000_000_000_000n,
-	);
+	const bytes = randomBytes(8);
+	let value = 0n;
+	for (const byte of bytes) {
+		value = (value << 8n) | BigInt(byte);
+	}
+	return `-${(value & INT63_MASK).toString()}`;
 }

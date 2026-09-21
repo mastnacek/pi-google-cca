@@ -1,12 +1,7 @@
 /**
  * Quota & rate-limit discovery for Google Cloud Code Assist (Antigravity).
- *
- * Queries Google's internal quota summary endpoint:
- *   POST https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary
- *
- * Returns model groups (Gemini models vs 3rd-party Claude/GPT), 5-hour rolling
- * windows, and weekly allocation windows with remaining capacity and exact
- * ISO-8601 reset timestamps.
+ * Queries Antigravity's retrieveUserQuotaSummary endpoint and falls back
+ * to model-level quota info if needed.
  */
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -14,27 +9,31 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
 	antigravityUserAgent,
+	ensureAntigravityVersion,
 	type GoogleOauthCredential,
 	refreshGoogleToken,
 } from "./oauth.ts";
 
 export interface QuotaBucket {
-	bucketId: string;
+	bucketId?: string;
 	displayName?: string;
-	window?: "5h" | "weekly" | string;
-	resetTime?: string;
 	description?: string;
-	remainingFraction: number;
+	window?: string;
+	remainingFraction?: number;
+	remainingAmount?: number | string;
+	disabled?: boolean;
+	resetTime?: string;
 }
 
 export interface QuotaGroup {
 	displayName?: string;
 	description?: string;
-	buckets: QuotaBucket[];
+	buckets?: QuotaBucket[];
 }
 
 export interface AntigravityQuotaSummary {
-	groups: QuotaGroup[];
+	buckets?: QuotaBucket[];
+	groups?: QuotaGroup[];
 	description?: string;
 }
 
@@ -60,7 +59,8 @@ export async function getValidGoogleCredential(): Promise<GoogleOauthCredential 
 		return null;
 	}
 
-	const googleEntry = authData["google"] as GoogleOauthCredential | undefined;
+	const providerKey = authData["google-antigravity"] ? "google-antigravity" : "google";
+	const googleEntry = authData[providerKey] as GoogleOauthCredential | undefined;
 	if (!googleEntry || typeof googleEntry !== "object") return null;
 	if (!googleEntry.access && !googleEntry.refresh) return null;
 
@@ -74,7 +74,7 @@ export async function getValidGoogleCredential(): Promise<GoogleOauthCredential 
 			const refreshed = (await refreshGoogleToken(
 				googleEntry,
 			)) as GoogleOauthCredential;
-			authData["google"] = refreshed;
+			authData[providerKey] = refreshed;
 			const tempPath = `${authPath}.${Date.now()}.tmp`;
 			writeFileSync(tempPath, JSON.stringify(authData, null, 2), "utf8");
 			renameSync(tempPath, authPath);
@@ -87,12 +87,13 @@ export async function getValidGoogleCredential(): Promise<GoogleOauthCredential 
 	return googleEntry;
 }
 
-/** Query the Antigravity user quota summary endpoint. */
+/** Query the Antigravity user quota summary endpoint with fallback. */
 export async function fetchAntigravityQuotaSummary(
 	accessToken: string,
 	projectId: string,
 	signal?: AbortSignal,
 ): Promise<AntigravityQuotaSummary | null> {
+	await ensureAntigravityVersion(signal);
 	const headers = {
 		Authorization: `Bearer ${accessToken}`,
 		"Content-Type": "application/json",
@@ -121,6 +122,51 @@ export async function fetchAntigravityQuotaSummary(
 			if (signal?.aborted) throw err;
 		}
 	}
+
+	// Fallback: fetch available models and extract quota buckets
+	for (const endpoint of ANTIGRAVITY_QUOTA_ENDPOINTS) {
+		try {
+			const timeoutSignal = AbortSignal.timeout(10_000);
+			const combinedSignal = signal
+				? AbortSignal.any([signal, timeoutSignal])
+				: timeoutSignal;
+
+			const res = await fetch(`${endpoint}/v1internal:fetchAvailableModels`, {
+				method: "POST",
+				headers,
+				body: JSON.stringify({}),
+				signal: combinedSignal,
+			});
+
+			if (res.ok) {
+				const data = (await res.json()) as {
+					models?: Record<string, {
+						displayName?: string;
+						quotaInfo?: { remainingFraction?: number; resetTime?: string };
+					}>;
+				};
+				if (data.models) {
+					const buckets: QuotaBucket[] = [];
+					for (const [id, m] of Object.entries(data.models)) {
+						if (m.quotaInfo) {
+							buckets.push({
+								bucketId: id,
+								displayName: m.displayName || id,
+								remainingFraction: m.quotaInfo.remainingFraction,
+								resetTime: m.quotaInfo.resetTime,
+							});
+						}
+					}
+					if (buckets.length > 0) {
+						return { buckets };
+					}
+				}
+			}
+		} catch (err) {
+			if (signal?.aborted) throw err;
+		}
+	}
+
 	return null;
 }
 
@@ -171,23 +217,30 @@ export function invalidateQuotaCache(): void {
 /** Format ISO-8601 timestamp to relative human countdown (e.g. "4h 27m", "3d 8h", "15m"). */
 export function formatRelativeTime(isoString?: string): string | null {
 	if (!isoString) return null;
-	const target = new Date(isoString).getTime();
-	if (Number.isNaN(target)) return null;
+	try {
+		const target = new Date(isoString).getTime();
+		if (Number.isNaN(target)) return null;
+		const diffMs = target - Date.now();
+		if (diffMs <= 0) return "now";
 
-	const diffMs = target - Date.now();
-	if (diffMs <= 0) return "0m";
+		const diffMinutes = Math.floor(diffMs / 60_000);
+		const days = Math.floor(diffMinutes / 1440);
+		const hours = Math.floor((diffMinutes % 1440) / 60);
+		const mins = diffMinutes % 60;
 
-	const totalMins = Math.floor(diffMs / 60_000);
-	const days = Math.floor(totalMins / (24 * 60));
-	const hours = Math.floor((totalMins % (24 * 60)) / 60);
-	const mins = totalMins % 60;
-
-	if (days > 0) return `${days}d ${hours}h`;
-	if (hours > 0) return `${hours}h ${mins}m`;
-	return `${mins}m`;
+		if (days > 0) {
+			return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+		}
+		if (hours > 0) {
+			return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+		}
+		return `${Math.max(1, mins)}m`;
+	} catch {
+		return null;
+	}
 }
 
-// ANSI colors for clean, theme-friendly terminal rendering
+// ANSI colors for clean terminal rendering
 export const ANSI_RESET = "\x1b[0m";
 export const ANSI_BOLD = "\x1b[1m";
 export const ANSI_GREEN = "\x1b[38;2;95;200;140m"; // Mint green (>35% remaining)
@@ -198,78 +251,82 @@ export const ANSI_LAVENDER = "\x1b[38;2;170;160;220m"; // Lavender labels (5h, W
 export const ANSI_DIM = "\x1b[38;2;120;124;140m"; // Dim for timers and separators
 
 function getCapacityColor(pct: number): string {
-	if (pct <= 15) return ANSI_RED;
-	if (pct <= 35) return ANSI_AMBER;
-	return ANSI_GREEN;
+	if (pct > 35) return ANSI_GREEN;
+	if (pct > 15) return ANSI_AMBER;
+	return ANSI_RED;
 }
 
 /**
  * Format compact one-line status string suitable for statusline / footer.
- * Example output:
+ * Example:
  *   "🪐 Antigravity: 5h 93% (4h27m) · Wk 77% (3d8h)"
  */
 export function formatQuotaStatusline(
 	summary: AntigravityQuotaSummary | null,
 ): string | null {
-	if (
-		!summary ||
-		!Array.isArray(summary.groups) ||
-		summary.groups.length === 0
-	) {
-		return null;
+	if (!summary) return null;
+
+	const allBuckets: QuotaBucket[] = [];
+	if (summary.groups) {
+		for (const g of summary.groups) {
+			if (g.buckets) allBuckets.push(...g.buckets);
+		}
 	}
+	if (summary.buckets) allBuckets.push(...summary.buckets);
 
-	// 1. Find Gemini group (Flash & Pro models)
-	const geminiGroup =
-		summary.groups.find((g) => g.displayName?.toLowerCase().includes("gemini")) ??
-		summary.groups[0];
+	const activeBuckets = allBuckets.filter((b) => !b.disabled);
+	if (activeBuckets.length === 0) return null;
 
-	if (!geminiGroup) return null;
-
-	const b5h = geminiGroup.buckets.find(
-		(b) => b.window === "5h" || b.bucketId.includes("5h"),
+	const fiveHourBucket = activeBuckets.find(
+		(b) =>
+			b.window?.toLowerCase().includes("5h") ||
+			b.displayName?.toLowerCase().includes("5 hour") ||
+			b.displayName?.toLowerCase().includes("five hour"),
 	);
-	const bWk = geminiGroup.buckets.find(
-		(b) => b.window === "weekly" || b.bucketId.includes("weekly"),
+	const weeklyBucket = activeBuckets.find(
+		(b) =>
+			b.window?.toLowerCase().includes("week") ||
+			b.displayName?.toLowerCase().includes("week") ||
+			b.displayName?.toLowerCase().includes("7d"),
 	);
 
 	const parts: string[] = [];
 
-	const formatSegment = (label: string, bucket: QuotaBucket) => {
-		const pct = Math.round(bucket.remainingFraction * 100);
+	if (fiveHourBucket && fiveHourBucket.remainingFraction !== undefined) {
+		const pct = Math.round(fiveHourBucket.remainingFraction * 100);
+		const resetStr = formatRelativeTime(fiveHourBucket.resetTime);
 		const color = getCapacityColor(pct);
-		const rel = bucket.resetTime ? formatRelativeTime(bucket.resetTime) : null;
-		const rstPart =
-			rel && pct < 100 ? ` ${ANSI_DIM}(rst ${rel})${ANSI_RESET}` : "";
-		return `${ANSI_LAVENDER}${label}${ANSI_RESET} ${ANSI_BOLD}${color}${pct}% left${ANSI_RESET}${rstPart}`;
-	};
-
-	if (b5h) {
-		parts.push(formatSegment("5h", b5h));
-	}
-
-	if (bWk) {
-		parts.push(formatSegment("Wk", bWk));
-	}
-
-	// 2. Check 3rd-party models (Claude & GPT) if quota has been consumed
-	const p3Group = summary.groups.find(
-		(g) =>
-			g.displayName?.toLowerCase().includes("claude") ||
-			g.displayName?.toLowerCase().includes("gpt"),
-	);
-	if (p3Group) {
-		const p3_5h = p3Group.buckets.find(
-			(b) => b.window === "5h" || b.bucketId.includes("5h"),
+		const timer = resetStr ? `${ANSI_DIM}(${resetStr})${ANSI_RESET}` : "";
+		parts.push(
+			`${ANSI_LAVENDER}5h${ANSI_RESET} ${color}${pct}%${ANSI_RESET}${timer ? ` ${timer}` : ""}`,
 		);
-		if (p3_5h && p3_5h.remainingFraction < 1) {
-			parts.push(formatSegment("3P", p3_5h));
+	}
+
+	if (weeklyBucket && weeklyBucket.remainingFraction !== undefined) {
+		const pct = Math.round(weeklyBucket.remainingFraction * 100);
+		const resetStr = formatRelativeTime(weeklyBucket.resetTime);
+		const color = getCapacityColor(pct);
+		const timer = resetStr ? `${ANSI_DIM}(${resetStr})${ANSI_RESET}` : "";
+		parts.push(
+			`${ANSI_LAVENDER}Wk${ANSI_RESET} ${color}${pct}%${ANSI_RESET}${timer ? ` ${timer}` : ""}`,
+		);
+	}
+
+	if (parts.length === 0) {
+		for (const b of activeBuckets.slice(0, 2)) {
+			if (b.remainingFraction !== undefined) {
+				const pct = Math.round(b.remainingFraction * 100);
+				const name = (b.displayName || b.bucketId || "Quota").slice(0, 10);
+				const color = getCapacityColor(pct);
+				parts.push(`${ANSI_LAVENDER}${name}${ANSI_RESET} ${color}${pct}%${ANSI_RESET}`);
+			}
 		}
 	}
 
 	if (parts.length === 0) return null;
+
 	const sep = ` ${ANSI_DIM}·${ANSI_RESET} `;
-	return `🪐 ${ANSI_BOLD}${ANSI_CYAN}Antigravity:${ANSI_RESET} ${parts.join(sep)}`;
+	return `${ANSI_CYAN}🪐 Antigravity:${ANSI_RESET} ${parts.join(sep)}`;
 }
 
 /** Format detailed Markdown banner for /google-quota command. */
@@ -277,33 +334,53 @@ export function formatQuotaDetailBanner(
 	summary: AntigravityQuotaSummary | null,
 ): string {
 	if (!summary) {
-		return "Unable to retrieve Antigravity quota information. Verify active Google OAuth session via `/login google`.";
+		return "⚠️ No active Google Antigravity quota information available. Authenticate via `/login google`.";
 	}
 
-	const lines: string[] = ["# Google Antigravity Quota & Reset Windows", ""];
-
-	for (const group of summary.groups) {
-		lines.push(`### ${group.displayName ?? "Model Group"}`);
-		if (group.description) lines.push(`_${group.description}_`);
-		lines.push("");
-
-		for (const bucket of group.buckets) {
-			const pct = Math.round(bucket.remainingFraction * 100);
-			const rel = formatRelativeTime(bucket.resetTime);
-			const resetStr = bucket.resetTime
-				? `resets in **${rel}** (${bucket.resetTime.replace("T", " ").replace("Z", " UTC")})`
-				: "no reset timestamp";
-
-			lines.push(
-				`- **${bucket.displayName ?? bucket.window ?? bucket.bucketId}**: **${pct}%** remaining · ${resetStr}`,
-			);
-		}
-		lines.push("");
-	}
+	const lines: string[] = [
+		"# 🪐 Google Cloud Code Assist (Antigravity) Quota",
+		"",
+	];
 
 	if (summary.description) {
-		lines.push("---");
-		lines.push(`ℹ️ ${summary.description}`);
+		lines.push(`> ${summary.description}`, "");
+	}
+
+	const printBucket = (b: QuotaBucket) => {
+		const name = b.displayName || b.bucketId || "Standard";
+		const disabledTag = b.disabled ? " *(disabled)*" : "";
+		let amountStr = "Available";
+		if (b.remainingFraction !== undefined) {
+			amountStr = `${Math.round(b.remainingFraction * 100)}% remaining`;
+		} else if (b.remainingAmount !== undefined) {
+			amountStr = `${b.remainingAmount} remaining`;
+		}
+
+		const resetTime = formatRelativeTime(b.resetTime);
+		const resetStr = resetTime
+			? ` — resets in **${resetTime}** (${b.resetTime})`
+			: "";
+		lines.push(`- **${name}**: ${amountStr}${disabledTag}${resetStr}`);
+		if (b.description) {
+			lines.push(`  *${b.description}*`);
+		}
+	};
+
+	if (summary.groups && summary.groups.length > 0) {
+		for (const g of summary.groups) {
+			lines.push(`### ${g.displayName || "Quota Group"}`);
+			if (g.description) lines.push(`*${g.description}*`);
+			if (g.buckets) {
+				for (const b of g.buckets) printBucket(b);
+			}
+			lines.push("");
+		}
+	} else if (summary.buckets && summary.buckets.length > 0) {
+		lines.push("### Active Quota Buckets");
+		for (const b of summary.buckets) printBucket(b);
+		lines.push("");
+	} else {
+		lines.push("No quota buckets returned by upstream API.");
 	}
 
 	return lines.join("\n");

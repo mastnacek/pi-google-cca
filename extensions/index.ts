@@ -1,30 +1,11 @@
 /**
- * Pi extension: browser OAuth login for the built-in `google` provider,
- * exactly like the omp CLI's Google login.
+ * Pi extension: browser OAuth login for the built-in `google` and `google-antigravity`
+ * providers, streaming via the Cloud Code Assist wire API instead of an AI Studio API key.
  *
- * What it does:
- *   - `pi.registerProvider("google", { oauth, streamSimple })` overrides the
- *     built-in google provider: NO model lists are added — pi's own google
- *     catalog (gemini-2.5-flash, gemini-3.7-flash, …) is kept as-is.
- *   - `/login google` runs the omp-style browser flow (loopback callback
- *     server, CSRF state, offline access) with a client picker:
- *       Antigravity (daily-cloudcode-pa, newest Gemini) or Gemini CLI
- *       (cloudcode-pa). Both are the public Cloud Code Assist clients omp
- *       embeds (ported from packages/ai/src/registry/oauth/ in oh-my-pi).
- *   - Requests are streamed through the Cloud Code Assist wire protocol
- *     (POST {endpoint}/v1internal:streamGenerateContent?alt=sse with the
- *     `{project, model, request}` envelope) instead of the Generative
- *     Language API, authenticating with the OAuth access token.
- *   - Tokens refresh automatically near expiry via the `oauth.refreshToken`
- *     hook; the grant's client variant and Cloud project id persist alongside
- *     the token in ~/.pi/agent/auth.json.
+ * Supports all Antigravity models: Gemini 3.x/2.5, Claude (Sonnet 4.6, Opus 4.6, Sonnet 4.5, Opus 4.5),
+ * and GPT-OSS (120B), with automatic endpoint failover, thinking config, and quota tracking.
  */
 import { randomUUID } from "node:crypto";
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
 import type {
 	Api,
 	AssistantMessage,
@@ -32,27 +13,30 @@ import type {
 	Context,
 	Model,
 	SimpleStreamOptions,
-	ThinkingLevel,
 } from "@earendil-works/pi-ai";
 import {
 	calculateCost,
 	createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import {
 	convertMessages,
 	convertTools,
 	isThinkingPart,
-	mapStopReasonString,
-	retainThoughtSignature,
-	type GeminiContent,
-	type GeminiPart,
-	type GoogleThinkingLevel,
 	type ModelWire,
+	retainThoughtSignature,
+	sanitizeSurrogates,
 } from "./google-wire.ts";
 import {
 	antigravityUserAgent,
 	deriveAntigravitySessionId,
+	ensureAntigravityVersion,
 	googleCredentialApiKey,
+	type GoogleVariantId,
 	loginGoogle,
 	refreshGoogleToken,
 } from "./oauth.ts";
@@ -64,16 +48,17 @@ import {
 } from "./quota.ts";
 
 const GEMINI_CLI_ENDPOINT = "https://cloudcode-pa.googleapis.com";
+const ANTIGRAVITY_PRIMARY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
+const ANTIGRAVITY_SANDBOX_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 const ANTIGRAVITY_ENDPOINTS = [
-	"https://daily-cloudcode-pa.googleapis.com",
-	"https://daily-cloudcode-pa.sandbox.googleapis.com",
+	ANTIGRAVITY_PRIMARY_ENDPOINT,
+	ANTIGRAVITY_SANDBOX_ENDPOINT,
 ];
 
 const REQUEST_TIMEOUT_MS = 300_000;
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 1_000;
 
-/** Gemini-CLI-style User-Agent: unlocks the CLI rate-limit tier. */
 function geminiCliUserAgent(modelId: string): string {
 	const version = process.env.PI_AI_GEMINI_CLI_VERSION || "0.46.0";
 	const platform = process.platform === "win32" ? "win32" : process.platform;
@@ -82,15 +67,15 @@ function geminiCliUserAgent(modelId: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Antigravity wire details (omp catalog): effort-routed model ids, fixed
-// output caps, labels.model_enum telemetry tokens. Sending the catalog's
-// logical id where a routed wire id is required yields 404 NOT_FOUND.
+// Antigravity wire profiles & routing
 // ---------------------------------------------------------------------------
 
-const ANTIGRAVITY_WIRE_PROFILES: Record<
-	string,
-	{ modelEnum?: string; maxOutputTokens: number }
-> = {
+export interface AntigravityModelWireProfile {
+	modelEnum?: string;
+	maxOutputTokens: number;
+}
+
+export const ANTIGRAVITY_WIRE_PROFILES: Record<string, AntigravityModelWireProfile> = {
 	"gemini-3.5-flash-extra-low": {
 		modelEnum: "MODEL_PLACEHOLDER_M187",
 		maxOutputTokens: 65_536,
@@ -147,16 +132,50 @@ const ANTIGRAVITY_WIRE_PROFILES: Record<
 		modelEnum: "MODEL_PLACEHOLDER_M16",
 		maxOutputTokens: 65_535,
 	},
+	"claude-sonnet-4-6": {
+		maxOutputTokens: 64_000,
+	},
+	"claude-opus-4-6-thinking": {
+		maxOutputTokens: 64_000,
+	},
+	"claude-sonnet-4-5": {
+		maxOutputTokens: 64_000,
+	},
+	"claude-sonnet-4-5-thinking": {
+		maxOutputTokens: 64_000,
+	},
+	"claude-opus-4-5": {
+		maxOutputTokens: 64_000,
+	},
+	"claude-opus-4-5-thinking": {
+		maxOutputTokens: 64_000,
+	},
+	"gpt-oss-120b-medium": {
+		maxOutputTokens: 65_536,
+	},
 };
 
-/** pi google catalog id → antigravity upstream wire id per thinking effort. */
 const ANTIGRAVITY_MODEL_ROUTING: Record<string, Record<string, string>> = {
-	"gemini-3-flash-preview": {
-		off: "gemini-3.5-flash-extra-low",
-		minimal: "gemini-3.5-flash-extra-low",
-		low: "gemini-3.5-flash-extra-low",
-		medium: "gemini-3.5-flash-low",
-		high: "gemini-3-flash-agent",
+	"gemini-3.7-flash": {
+		off: "gemini-3.7-flash-low",
+		minimal: "gemini-3.7-flash-low",
+		low: "gemini-3.7-flash-low",
+		medium: "gemini-3.7-flash-medium",
+		high: "gemini-3.7-flash-high",
+	},
+	"gemini-3.7-flash-preview": {
+		off: "gemini-3.7-flash-low",
+		minimal: "gemini-3.7-flash-low",
+		low: "gemini-3.7-flash-low",
+		medium: "gemini-3.7-flash-medium",
+		high: "gemini-3.7-flash-high",
+	},
+	"gemini-3.6-flash": {
+		off: "gemini-3.6-flash-low",
+		minimal: "gemini-3.6-flash-low",
+		low: "gemini-3.6-flash-low",
+		medium: "gemini-3.6-flash-medium",
+		high: "gemini-3.6-flash-high",
 	},
 	"gemini-3.5-flash": {
 		off: "gemini-3.5-flash-extra-low",
@@ -172,26 +191,19 @@ const ANTIGRAVITY_MODEL_ROUTING: Record<string, Record<string, string>> = {
 		medium: "gemini-3.5-flash-low",
 		high: "gemini-3-flash-agent",
 	},
-	"gemini-3.6-flash": {
-		off: "gemini-3.6-flash-low",
-		minimal: "gemini-3.6-flash-low",
-		low: "gemini-3.6-flash-low",
-		medium: "gemini-3.6-flash-medium",
-		high: "gemini-3.6-flash-high",
+	"gemini-3-flash": {
+		off: "gemini-3.5-flash-extra-low",
+		minimal: "gemini-3.5-flash-extra-low",
+		low: "gemini-3.5-flash-extra-low",
+		medium: "gemini-3.5-flash-low",
+		high: "gemini-3-flash-agent",
 	},
-	"gemini-3.7-flash": {
-		off: "gemini-3.7-flash-low",
-		minimal: "gemini-3.7-flash-low",
-		low: "gemini-3.7-flash-low",
-		medium: "gemini-3.7-flash-medium",
-		high: "gemini-3.7-flash-high",
-	},
-	"gemini-3.8-flash": {
-		off: "gemini-3.8-flash-low",
-		minimal: "gemini-3.8-flash-low",
-		low: "gemini-3.8-flash-low",
-		medium: "gemini-3.8-flash-medium",
-		high: "gemini-3.8-flash-high",
+	"gemini-3-flash-preview": {
+		off: "gemini-3.5-flash-extra-low",
+		minimal: "gemini-3.5-flash-extra-low",
+		low: "gemini-3.5-flash-extra-low",
+		medium: "gemini-3.5-flash-low",
+		high: "gemini-3-flash-agent",
 	},
 	"gemini-flash-latest": {
 		off: "gemini-3.5-flash-extra-low",
@@ -207,44 +219,79 @@ const ANTIGRAVITY_MODEL_ROUTING: Record<string, Record<string, string>> = {
 		medium: "gemini-3.5-flash-low",
 		high: "gemini-3-flash-agent",
 	},
+	"gemini-3.1-pro": {
+		off: "gemini-3.1-pro-low",
+		minimal: "gemini-3.1-pro-low",
+		low: "gemini-3.1-pro-low",
+		high: "gemini-pro-agent",
+	},
 	"gemini-3.1-pro-preview": {
 		off: "gemini-3.1-pro-low",
 		minimal: "gemini-3.1-pro-low",
 		low: "gemini-3.1-pro-low",
-		medium: "gemini-3.1-pro-low",
 		high: "gemini-pro-agent",
 	},
 	"gemini-3.1-pro-preview-customtools": {
 		off: "gemini-3.1-pro-low",
 		minimal: "gemini-3.1-pro-low",
 		low: "gemini-3.1-pro-low",
-		medium: "gemini-3.1-pro-low",
 		high: "gemini-pro-agent",
+	},
+	"gemini-3-pro": {
+		off: "gemini-3-pro-low",
+		minimal: "gemini-3-pro-low",
+		low: "gemini-3-pro-low",
+		high: "gemini-3-pro-high",
+	},
+	"claude-sonnet-4-6": {
+		off: "claude-sonnet-4-6",
+		minimal: "claude-sonnet-4-6",
+		low: "claude-sonnet-4-6",
+		medium: "claude-sonnet-4-6",
+		high: "claude-sonnet-4-6",
+	},
+	"claude-opus-4-6": {
+		off: "claude-opus-4-6-thinking",
+		minimal: "claude-opus-4-6-thinking",
+		low: "claude-opus-4-6-thinking",
+		medium: "claude-opus-4-6-thinking",
+		high: "claude-opus-4-6-thinking",
+	},
+	"claude-sonnet-4-5": {
+		off: "claude-sonnet-4-5",
+		minimal: "claude-sonnet-4-5-thinking",
+		low: "claude-sonnet-4-5-thinking",
+		medium: "claude-sonnet-4-5-thinking",
+		high: "claude-sonnet-4-5-thinking",
+	},
+	"claude-opus-4-5": {
+		off: "claude-opus-4-5",
+		minimal: "claude-opus-4-5-thinking",
+		low: "claude-opus-4-5-thinking",
+		medium: "claude-opus-4-5-thinking",
+		high: "claude-opus-4-5-thinking",
+	},
+	"gpt-oss-120b": {
+		off: "gpt-oss-120b-medium",
+		minimal: "gpt-oss-120b-medium",
+		low: "gpt-oss-120b-medium",
+		medium: "gpt-oss-120b-medium",
+		high: "gpt-oss-120b-medium",
 	},
 };
 
-function antigravityWireModelId(
-	modelId: string,
-	effort: string | undefined,
-): string {
-	const routing = ANTIGRAVITY_MODEL_ROUTING[modelId];
-	if (!routing) return modelId;
-	return routing[effort ?? "off"] ?? Object.values(routing)[0]!;
+function isClaudeModel(id: string): boolean {
+	return id.toLowerCase().startsWith("claude-");
 }
 
-// ---------------------------------------------------------------------------
-// Thinking config (same policy as pi-ai's google adapter)
-// ---------------------------------------------------------------------------
-
-interface ThinkingConfig {
-	includeThoughts: boolean;
-	thinkingLevel?: GoogleThinkingLevel;
-	thinkingBudget?: number;
+function isGptModel(id: string): boolean {
+	return id.toLowerCase().startsWith("gpt-");
 }
 
 function isGemini3Pro(id: string): boolean {
 	return /gemini-3(?:\.\d+)?-pro/.test(id.toLowerCase());
 }
+
 function isGemini3Flash(id: string): boolean {
 	const lower = id.toLowerCase();
 	return (
@@ -254,48 +301,103 @@ function isGemini3Flash(id: string): boolean {
 	);
 }
 
+function antigravityWireModelId(modelId: string, effort: string | undefined): string {
+	const routing = ANTIGRAVITY_MODEL_ROUTING[modelId];
+	if (routing) {
+		return routing[effort ?? "off"] ?? Object.values(routing)[0]!;
+	}
+	// Generic flash template routing for future gemini-{rev}-flash
+	const flashMatch = /^gemini-(\d+(?:\.\d+)?)-flash/.exec(modelId);
+	if (flashMatch) {
+		const rev = flashMatch[1];
+		if (effort === "high") return `gemini-${rev}-flash-high`;
+		if (effort === "medium") return `gemini-${rev}-flash-medium`;
+		return `gemini-${rev}-flash-low`;
+	}
+	return modelId;
+}
+
+// ---------------------------------------------------------------------------
+// Thinking config
+// ---------------------------------------------------------------------------
+
+interface ThinkingConfig {
+	includeThoughts: boolean;
+	thinkingLevel?: "LOW" | "MEDIUM" | "HIGH" | "MINIMAL";
+	thinkingBudget?: number;
+}
+
 function thinkingConfigFor(
 	model: Model<Api>,
 	options: SimpleStreamOptions | undefined,
 ): ThinkingConfig | undefined {
-	if (!model.reasoning) return undefined;
+	const reasoning = options?.reasoning;
+	const isClaude = isClaudeModel(model.id);
+	const isGpt = isGptModel(model.id);
 
-	if (!options?.reasoning) {
-		// Explicit off. Gemini 3 models cannot fully disable thinking; hide it.
-		if (isGemini3Pro(model.id))
+	if (!reasoning) {
+		if (isGemini3Flash(model.id) || isGemini3Pro(model.id)) {
 			return { includeThoughts: false, thinkingLevel: "LOW" };
-		if (isGemini3Flash(model.id))
-			return { includeThoughts: false, thinkingLevel: "MINIMAL" };
-		return { includeThoughts: false, thinkingBudget: 0 };
+		}
+		if (isClaude || isGpt || model.id.includes("gemini-2.5")) {
+			return { includeThoughts: false, thinkingBudget: 0 };
+		}
+		return undefined;
 	}
 
-	const effort: ThinkingLevel = options.reasoning;
-	if (isGemini3Pro(model.id)) {
-		return {
-			includeThoughts: true,
-			thinkingLevel: effort === "minimal" || effort === "low" ? "LOW" : "HIGH",
-		};
+	if (isClaude || isGpt) {
+		const budget =
+			typeof reasoning === "number"
+				? reasoning
+				: reasoning === "high"
+					? 10_000
+					: reasoning === "medium"
+						? 4_000
+						: 1_000;
+		return { includeThoughts: true, thinkingBudget: budget };
 	}
+
+	if (isGemini3Pro(model.id)) {
+		if (model.id.includes("3.1")) {
+			const budget = reasoning === "high" ? 10_001 : 1_001;
+			return { includeThoughts: true, thinkingBudget: budget };
+		}
+		return { includeThoughts: true, thinkingLevel: reasoning === "high" ? "HIGH" : "LOW" };
+	}
+
 	if (isGemini3Flash(model.id)) {
-		let level: GoogleThinkingLevel = "HIGH";
-		if (effort === "minimal") level = "MINIMAL";
-		else if (effort === "low") level = "LOW";
-		else if (effort === "medium") level = "MEDIUM";
+		if (model.id.includes("3.5") || model.id === "gemini-3-flash") {
+			const budget =
+				reasoning === "high"
+					? 10_000
+					: reasoning === "medium"
+						? 4_000
+						: 1_000;
+			return { includeThoughts: true, thinkingBudget: budget };
+		}
+		// Gemini 3.6+ Flash: uses thinkingLevel (MINIMAL is rejected upstream, mapped to LOW)
+		const level =
+			reasoning === "high"
+				? "HIGH"
+				: reasoning === "medium"
+					? "MEDIUM"
+					: "LOW";
 		return { includeThoughts: true, thinkingLevel: level };
 	}
-	// Token budgets for the 2.5 family.
-	const budgets: Record<string, Partial<Record<ThinkingLevel, number>>> = {
-		"gemini-2.5-pro": { minimal: 128, low: 2048, medium: 8192, high: 32_768 },
-		"gemini-2.5-flash-lite": {
-			minimal: 512,
-			low: 2048,
-			medium: 8192,
-			high: 24_576,
-		},
-		"gemini-2.5-flash": { minimal: 128, low: 2048, medium: 8192, high: 24_576 },
-	};
-	const budget = (budgets[model.id] ?? {})[effort];
-	return { includeThoughts: true, thinkingBudget: budget ?? -1 };
+
+	if (reasoning !== undefined) {
+		const budget =
+			typeof reasoning === "number"
+				? reasoning
+				: reasoning === "high"
+					? 8_192
+					: reasoning === "medium"
+						? 4_096
+						: 2_048;
+		return { includeThoughts: true, thinkingBudget: budget };
+	}
+
+	return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -306,41 +408,47 @@ interface CcaRequest {
 	project: string;
 	model: string;
 	request: {
-		contents: GeminiContent[];
+		contents: unknown[];
 		sessionId?: string;
 		systemInstruction?: { role?: string; parts: { text: string }[] };
 		generationConfig?: {
-			temperature?: number;
 			maxOutputTokens?: number;
+			temperature?: number;
+			topP?: number;
+			topK?: number;
 			thinkingConfig?: ThinkingConfig;
 		};
 		tools?: { functionDeclarations: unknown[] }[];
-		toolConfig?: { functionCallingConfig: { mode: string } };
+		toolConfig?: {
+			functionCallingConfig: {
+				mode: "AUTO" | "ANY" | "NONE" | "VALIDATED";
+				allowedFunctionNames?: string[];
+			};
+		};
 		labels?: Record<string, string>;
 	};
-	requestType?: string;
 	userAgent?: string;
+	requestType?: string;
 	requestId?: string;
 }
 
-/** Per-conversation Antigravity envelope state (one conversation per pi process). */
-const antigravitySession = {
-	agentId: undefined as string | undefined,
-	trajectoryId: undefined as string | undefined,
-	sessionId: undefined as string | undefined,
-	stepIndex: undefined as number | undefined,
-	lastExecutionId: undefined as string | undefined,
-};
+const antigravitySession: {
+	agentId?: string;
+	trajectoryId?: string;
+	sessionId?: string;
+	stepIndex?: number;
+	lastExecutionId?: string;
+	lastGoodEndpoint?: string;
+} = {};
 
 function firstUserText(context: Context): string | undefined {
 	for (const message of context.messages) {
 		if (message.role !== "user") continue;
 		if (typeof message.content === "string") return message.content;
 		if (Array.isArray(message.content)) {
-			const firstText = message.content.find((item) => item.type === "text");
-			return firstText && "text" in firstText ? firstText.text : undefined;
+			const first = message.content.find((p) => p.type === "text");
+			if (first && "text" in first) return first.text as string;
 		}
-		return undefined;
 	}
 	return undefined;
 }
@@ -360,55 +468,80 @@ function buildCcaRequest(
 	};
 	const contents = convertMessages(wireModel, context);
 	const generationConfig: CcaRequest["request"]["generationConfig"] = {};
-	if (options?.temperature !== undefined)
+
+	if (options?.temperature !== undefined) {
 		generationConfig.temperature = options.temperature;
-	if (options?.maxTokens !== undefined)
+	}
+	if (options?.maxTokens !== undefined) {
 		generationConfig.maxOutputTokens = options.maxTokens;
+	}
 
 	const thinking = thinkingConfigFor(model, options);
-	if (thinking) generationConfig.thinkingConfig = thinking;
+	if (thinking) {
+		generationConfig.thinkingConfig = thinking;
+	}
 
 	const request: CcaRequest["request"] = { contents };
+
 	if (context.systemPrompt && context.systemPrompt.trim().length > 0) {
-		// Antigravity tags systemInstruction with role "user" (mirrors the real client).
+		// Antigravity tags systemInstruction with role "user"
 		request.systemInstruction = {
 			...(isAntigravity ? { role: "user" } : {}),
 			parts: [{ text: context.systemPrompt }],
 		};
 	}
+
+	const wireModelId = isAntigravity
+		? antigravityWireModelId(model.id, typeof options?.reasoning === "string" ? options.reasoning : undefined)
+		: model.id;
+	const isClaude = isClaudeModel(model.id) || isClaudeModel(wireModelId);
+
 	if (context.tools && context.tools.length > 0) {
 		request.tools = convertTools(context.tools);
-		// Antigravity's default tool mode is VALIDATED (verified for Gemini and
-		// Claude in omp); without it the backend may answer in text.
 		if (isAntigravity) {
 			request.toolConfig = { functionCallingConfig: { mode: "VALIDATED" } };
 		}
 	}
-	if (Object.keys(generationConfig).length > 0)
+
+	// Claude on Antigravity always forces VALIDATED tool mode, even with no tools declared
+	if (isAntigravity && isClaude) {
+		request.toolConfig = { functionCallingConfig: { mode: "VALIDATED" } };
+	}
+
+	if (Object.keys(generationConfig).length > 0) {
 		request.generationConfig = generationConfig;
+	}
 
-	if (!isAntigravity) return { project: projectId, model: model.id, request };
+	if (!isAntigravity) {
+		return { project: projectId, model: model.id, request };
+	}
 
-	// Antigravity envelope: effort-routed wire id, fixed output cap, sessionId,
-	// structured requestId, labels.
-	const wireModelId = antigravityWireModelId(model.id, options?.reasoning);
+	// Antigravity envelope: effort-routed wire id, fixed output cap, sessionId, structured requestId, labels
 	const profile = ANTIGRAVITY_WIRE_PROFILES[wireModelId];
-	if (profile) generationConfig.maxOutputTokens = profile.maxOutputTokens;
+	if (profile) {
+		generationConfig.maxOutputTokens = profile.maxOutputTokens;
+	} else if (isClaude) {
+		generationConfig.maxOutputTokens = 64_000;
+	}
 
 	const state = antigravitySession;
 	state.agentId ??= randomUUID();
 	state.trajectoryId ??= randomUUID();
 	state.sessionId ??= deriveAntigravitySessionId(firstUserText(context));
 	state.stepIndex = (state.stepIndex ?? 1) + 1;
+
 	const requestId = `agent/${state.agentId}/${Date.now()}/${state.trajectoryId}/${state.stepIndex}`;
 	const labels: Record<string, string> = {};
 	if (state.lastExecutionId) labels.last_execution_id = state.lastExecutionId;
 	labels.last_step_index = String((state.stepIndex ?? 2) - 1);
 	if (profile?.modelEnum !== undefined) labels.model_enum = profile.modelEnum;
 	labels.trajectory_id = state.trajectoryId;
+	labels.used_claude = isClaude ? "true" : "false";
+	labels.used_claude_conservative = isClaude ? "true" : "false";
 
 	request.labels = labels;
 	request.sessionId = state.sessionId;
+
 	return {
 		project: projectId,
 		requestId,
@@ -420,13 +553,21 @@ function buildCcaRequest(
 }
 
 // ---------------------------------------------------------------------------
-// Response streaming
+// Response streaming & Planning leak guard
 // ---------------------------------------------------------------------------
 
 interface CcaResponseChunk {
 	response?: {
 		candidates?: Array<{
-			content?: { role: string; parts?: GeminiPart[] };
+			content?: {
+				role: string;
+				parts?: Array<{
+					text?: string;
+					thought?: boolean;
+					thoughtSignature?: string;
+					functionCall?: { name: string; args: Record<string, unknown>; id?: string };
+				}>;
+			};
 			finishReason?: string;
 		}>;
 		usageMetadata?: {
@@ -439,39 +580,34 @@ interface CcaResponseChunk {
 		responseId?: string;
 		promptFeedback?: { blockReason?: string; blockReasonMessage?: string };
 	};
-	/** In-band stream failure (quota, internal error) as a final JSON event. */
 	error?: { code?: number; message?: string; status?: string };
 }
 
-/** Minimal SSE reader: yields the JSON payload of each `data:` line. */
-async function* readSseData(
-	body: ReadableStream<Uint8Array>,
-): AsyncGenerator<string> {
+async function* readSseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
 	let buffer = "";
 	try {
-		for (;;) {
+		while (true) {
 			const { done, value } = await reader.read();
 			if (done) break;
 			buffer += decoder.decode(value, { stream: true });
-			for (;;) {
-				const newline = buffer.indexOf("\n");
-				if (newline < 0) break;
-				const line = buffer.slice(0, newline).replace(/\r$/, "");
-				buffer = buffer.slice(newline + 1);
-				if (line.startsWith("data: ")) yield line.slice(6);
+			const lines = buffer.split(/\r?\n/);
+			buffer = lines.pop() ?? "";
+			for (const line of lines) {
+				const trimmed = line.trim();
+				if (trimmed.startsWith("data:")) {
+					yield trimmed.slice(5).trim();
+				}
 			}
+		}
+		if (buffer.trim().startsWith("data:")) {
+			yield buffer.trim().slice(5).trim();
 		}
 	} finally {
 		reader.releaseLock();
 	}
 }
-
-// --- Gemini Flash planning-leak guard (ported from omp google-gemini-cli) ---
-// Some Flash models emit their internal planning object as visible text
-// (`{"thought": ...}`). Buffer a leading `{` run and strip it when it matches
-// the leak signature; release as normal text otherwise.
 
 function isPlanningLeakPrefix(text: string): boolean {
 	const trimmed = text.trimStart();
@@ -479,14 +615,14 @@ function isPlanningLeakPrefix(text: string): boolean {
 	const afterBrace = trimmed.slice(1).trimStart();
 	if (afterBrace === "") return trimmed.length <= 100;
 	if (afterBrace[0] !== '"') return false;
-	const nextQuote = afterBrace.indexOf('"', 1);
-	if (nextQuote === -1) {
+	const nextQuoteIndex = afterBrace.indexOf('"', 1);
+	if (nextQuoteIndex === -1) {
 		const keyPrefix = afterBrace.slice(1);
 		return "thought".startsWith(keyPrefix) && trimmed.length <= 100;
 	}
-	const key = afterBrace.slice(1, nextQuote);
+	const key = afterBrace.slice(1, nextQuoteIndex);
 	if (key !== "thought") return false;
-	const afterKey = afterBrace.slice(nextQuote + 1).trimStart();
+	const afterKey = afterBrace.slice(nextQuoteIndex + 1).trimStart();
 	if (afterKey === "") return trimmed.length <= 100;
 	return afterKey[0] === ":";
 }
@@ -498,9 +634,11 @@ function splitLeadingJsonObject(
 	const prefixLength = text.length - text.trimStart().length;
 	const trimmed = text.slice(prefixLength);
 	if (!trimmed.startsWith("{")) return undefined;
+
 	let depth = 0;
 	let inString = false;
 	let escaped = false;
+
 	for (let i = 0; i < trimmed.length; i++) {
 		const ch = trimmed[i];
 		if (!ignoreQuotes) {
@@ -521,31 +659,33 @@ function splitLeadingJsonObject(
 				continue;
 			}
 		}
-		if (ch === "{") depth++;
-		else if (ch === "}") {
-			depth--;
-			if (depth === 0)
-				return { jsonText: trimmed.slice(0, i + 1), rest: trimmed.slice(i + 1) };
+		if (ch === "{") {
+			depth++;
+			continue;
+		}
+		if (ch !== "}") continue;
+		depth--;
+		if (depth === 0) {
+			return {
+				jsonText: trimmed.slice(0, i + 1),
+				rest: trimmed.slice(i + 1),
+			};
 		}
 	}
 	return undefined;
 }
 
-function isPlanningLeakObject(
-	parsed: unknown,
-	toolNames: Set<string>,
-): boolean {
+function isPlanningLeakObject(parsed: unknown, toolNames: Set<string>): boolean {
 	if (!parsed || typeof parsed !== "object") return false;
-	const record = parsed as Record<string, unknown>;
-	const hasThought = typeof record.thought === "string";
-	const isOmpTool =
-		typeof record.call === "string" && toolNames.has(record.call);
-	const hasToolSignature =
-		"_i" in record ||
-		"paths" in record ||
-		"command" in record ||
-		("path" in record && "content" in record);
-	return hasThought || isOmpTool || hasToolSignature;
+	const rec = parsed as Record<string, unknown>;
+	const hasThought = typeof rec.thought === "string";
+	const isToolCall = typeof rec.call === "string" && toolNames.has(rec.call);
+	const hasToolSig =
+		"_i" in rec ||
+		"paths" in rec ||
+		"command" in rec ||
+		("path" in rec && "content" in rec);
+	return hasThought || isToolCall || hasToolSig;
 }
 
 type BufferedPlanning =
@@ -558,25 +698,25 @@ function consumePlanningBuffer(
 	toolNames: Set<string>,
 	isFinal = false,
 ): BufferedPlanning {
-	if (!isPlanningLeakPrefix(text)) return { kind: "plain", visibleText: text };
+	if (!isPlanningLeakPrefix(text)) {
+		return { kind: "plain", visibleText: text };
+	}
 
-	const leading =
-		splitLeadingJsonObject(text, false) ?? splitLeadingJsonObject(text, true);
+	let leading = splitLeadingJsonObject(text, false) ?? splitLeadingJsonObject(text, true);
 
 	if (!leading) {
 		if (isFinal) {
 			const trimmed = text.trim();
-			const hasThoughtKey = trimmed.includes('"thought"');
-			const hasToolKey = [...toolNames].some((name) =>
-				trimmed.includes(`"${name}"`),
-			);
-			const hasToolSignature =
+			const hasThought = trimmed.includes('"thought"');
+			const hasTool = Array.from(toolNames).some((n) => trimmed.includes(`"${n}"`));
+			const hasSig =
 				trimmed.includes('"_i"') ||
 				trimmed.includes('"paths"') ||
 				trimmed.includes('"command"') ||
 				(trimmed.includes('"path"') && trimmed.includes('"content"'));
-			if (hasThoughtKey || hasToolKey || hasToolSignature)
+			if (hasThought || hasTool || hasSig) {
 				return { kind: "leak", visibleText: "" };
+			}
 			return { kind: "plain", visibleText: text };
 		}
 		return { kind: "incomplete" };
@@ -586,11 +726,9 @@ function consumePlanningBuffer(
 	try {
 		parsed = JSON.parse(leading.jsonText);
 	} catch {
-		const hasThoughtKey = leading.jsonText.includes('"thought"');
-		const hasToolKey = [...toolNames].some((name) =>
-			leading.jsonText.includes(`"${name}"`),
-		);
-		const isLeak = hasThoughtKey || hasToolKey;
+		const isLeak =
+			leading.jsonText.includes('"thought"') ||
+			Array.from(toolNames).some((n) => leading.jsonText.includes(`"${n}"`));
 		return isLeak
 			? { kind: "leak", visibleText: leading.rest }
 			: { kind: "plain", visibleText: text };
@@ -601,38 +739,44 @@ function consumePlanningBuffer(
 		: { kind: "plain", visibleText: text };
 }
 
-// ---------------------------------------------------------------------------
-
 let toolCallCounter = 0;
 
 interface ParsedCredential {
 	token: string;
 	projectId: string;
-	variant: "antigravity" | "gemini-cli";
+	variant: GoogleVariantId;
 }
 
 function parseStoredCredential(apiKey: string | undefined): ParsedCredential {
 	if (!apiKey) {
 		throw new Error(
-			"google provider is set up for Google OAuth (Cloud Code Assist). Run /login google to authenticate.",
+			"No Google Cloud Code Assist credentials found. Run `/login google` in the terminal first.",
 		);
 	}
-	// The oauth getApiKey hook serializes {token, projectId, variant}; anything
-	// else (e.g. a leftover AI Studio key) cannot drive the CCA protocol.
+
 	try {
-		const parsed = JSON.parse(apiKey) as Partial<ParsedCredential>;
-		if (parsed.token && parsed.projectId) {
+		const parsed = JSON.parse(apiKey) as {
+			token?: string;
+			access?: string;
+			projectId?: string;
+			project_id?: string;
+			variant?: GoogleVariantId;
+		};
+		const token = parsed.token || parsed.access;
+		const projectId = parsed.projectId || parsed.project_id;
+		if (token && projectId) {
 			return {
-				token: parsed.token,
-				projectId: parsed.projectId,
-				variant: parsed.variant === "gemini-cli" ? "gemini-cli" : "antigravity",
+				token,
+				projectId,
+				variant: parsed.variant || "antigravity",
 			};
 		}
 	} catch {
-		/* not our JSON — fall through to the guidance error */
+		// Not JSON, fall through
 	}
+
 	throw new Error(
-		"google provider is set up for Google OAuth (Cloud Code Assist); an API key cannot drive it. Run /login google to authenticate in the browser.",
+		"Google Cloud Code Assist requires OAuth credentials. Run `/login google` to authenticate.",
 	);
 }
 
@@ -641,26 +785,32 @@ function isRetriableStatus(status: number): boolean {
 }
 
 function isRetriableTransportError(err: unknown): boolean {
+	if (!err || typeof err !== "object") return false;
+	const msg = (err as Error).message || "";
 	return (
-		err instanceof Error &&
-		(err.name === "TypeError" ||
-			err.name === "TimeoutError" ||
-			/HTTP \d{3}/.test(err.message) ||
-			/fetch failed|network|ECONNRESET|socket|hang up/i.test(err.message))
+		msg.includes("fetch failed") ||
+		msg.includes("ECONNRESET") ||
+		msg.includes("ETIMEDOUT") ||
+		msg.includes("ECONNREFUSED") ||
+		msg.includes("UND_ERR_SOCKET")
 	);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve, reject) => {
-		const timer = setTimeout(resolve, ms);
-		signal?.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timer);
-				reject(new Error("Request was aborted"));
-			},
-			{ once: true },
-		);
+		if (signal?.aborted) {
+			reject(new Error("Request was aborted"));
+			return;
+		}
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(new Error("Request was aborted"));
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
 	});
 }
 
@@ -672,19 +822,16 @@ async function doFetchWithRetry(
 	const fetchImpl = options?.fetch ?? fetch;
 	let lastError: unknown;
 	for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-		if (attempt > 0)
+		if (attempt > 0) {
 			await sleep(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), options?.signal);
+		}
 		try {
 			const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
 			const signal = options?.signal
 				? AbortSignal.any([options.signal, timeoutSignal])
 				: timeoutSignal;
 			const response = await fetchImpl(url, { ...init, signal });
-			if (
-				!response.ok &&
-				isRetriableStatus(response.status) &&
-				attempt < MAX_RETRIES
-			) {
+			if (!response.ok && isRetriableStatus(response.status) && attempt < MAX_RETRIES) {
 				lastError = new Error(`HTTP ${response.status}`);
 				continue;
 			}
@@ -728,19 +875,33 @@ function streamGoogleCca(
 		try {
 			const credential = parseStoredCredential(options?.apiKey);
 			const isAntigravity = credential.variant === "antigravity";
-			const endpoints = isAntigravity
-				? ANTIGRAVITY_ENDPOINTS
+			await ensureAntigravityVersion(options?.signal);
+
+			let endpoints = isAntigravity
+				? (antigravitySession.lastGoodEndpoint
+						? [antigravitySession.lastGoodEndpoint, ...ANTIGRAVITY_ENDPOINTS.filter((e) => e !== antigravitySession.lastGoodEndpoint)]
+						: ANTIGRAVITY_ENDPOINTS)
 				: [GEMINI_CLI_ENDPOINT];
-			const body = JSON.stringify(
-				buildCcaRequest(
-					model,
-					context,
-					credential.projectId,
-					options,
-					isAntigravity,
-				),
+
+			let requestPayload: unknown = buildCcaRequest(
+				model,
+				context,
+				credential.projectId,
+				options,
+				isAntigravity,
 			);
-			const headers = {
+
+			if (options?.onPayload) {
+				const replacement = await options.onPayload(requestPayload, model);
+				if (replacement !== undefined) {
+					requestPayload = replacement;
+				}
+			}
+
+			const body = JSON.stringify(requestPayload);
+			const isClaude = isClaudeModel(model.id);
+
+			const headers: Record<string, string> = {
 				Authorization: `Bearer ${credential.token}`,
 				"Content-Type": "application/json",
 				Accept: "text/event-stream",
@@ -748,9 +909,11 @@ function streamGoogleCca(
 					? { "User-Agent": antigravityUserAgent() }
 					: {
 							"User-Agent": geminiCliUserAgent(model.id),
-							"Client-Metadata":
-								"ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
+							"Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI",
 						}),
+				...(isAntigravity && isClaude && options?.reasoning
+					? { "anthropic-beta": "interleaved-thinking-2025-05-14" }
+					: {}),
 				...(options?.headers ?? {}),
 			};
 
@@ -758,6 +921,7 @@ function streamGoogleCca(
 			const isLeakModel = model.id.includes("flash");
 			let started = false;
 			let firstTokenTime: number | undefined;
+
 			const ensureStarted = () => {
 				if (!started) {
 					if (!firstTokenTime) firstTokenTime = performance.now();
@@ -765,6 +929,7 @@ function streamGoogleCca(
 					started = true;
 				}
 			};
+
 			const resetOutput = () => {
 				output.content = [];
 				output.usage = {
@@ -781,8 +946,7 @@ function streamGoogleCca(
 
 			/** Consume one SSE response into `output`. Returns true when content arrived. */
 			const consumeResponse = async (response: Response): Promise<boolean> => {
-				if (!response.body)
-					throw new Error("Cloud Code Assist: empty response body");
+				if (!response.body) throw new Error("Cloud Code Assist: empty response body");
 
 				let currentBlock:
 					| { type: "text"; text: string; textSignature?: string }
@@ -816,6 +980,7 @@ function streamGoogleCca(
 					}
 					currentBlock = null;
 				};
+
 				const startTextBlock = () => {
 					if (currentBlock?.type !== "text") {
 						endCurrentBlock();
@@ -830,6 +995,7 @@ function streamGoogleCca(
 					}
 					return currentBlock;
 				};
+
 				const startThinkingBlock = () => {
 					if (currentBlock?.type !== "thinking") {
 						endCurrentBlock();
@@ -848,14 +1014,12 @@ function streamGoogleCca(
 					}
 					return currentBlock;
 				};
+
 				const emitText = (delta: string, signature?: string) => {
 					if (!delta) return;
 					const block = startTextBlock();
 					block.text += delta;
-					block.textSignature = retainThoughtSignature(
-						block.textSignature,
-						signature,
-					);
+					block.textSignature = retainThoughtSignature(block.textSignature, signature);
 					stream.push({
 						type: "text_delta",
 						contentIndex: blockIndex(),
@@ -863,11 +1027,13 @@ function streamGoogleCca(
 						partial: output,
 					});
 				};
+
 				const flushLeakBuffer = () => {
 					if (!isBuffering) return;
 					const buffered = consumePlanningBuffer(textBuffer, toolNames, true);
-					if (buffered.kind !== "incomplete")
+					if (buffered.kind !== "incomplete") {
 						emitText(buffered.visibleText, bufferedSignature);
+					}
 					isBuffering = false;
 					textBuffer = "";
 					bufferedSignature = undefined;
@@ -882,18 +1048,14 @@ function streamGoogleCca(
 					}
 
 					if (chunk.error) {
-						const detail =
-							chunk.error.message || chunk.error.status || "unknown error";
+						const detail = chunk.error.message || chunk.error.status || "unknown error";
 						throw new Error(`Cloud Code Assist stream error: ${detail}`);
 					}
 					const responseData = chunk.response;
 					if (!responseData) continue;
 					if (responseData.responseId) lastResponseId = responseData.responseId;
 
-					if (
-						!responseData.candidates?.length &&
-						responseData.promptFeedback?.blockReason
-					) {
+					if (!responseData.candidates?.length && responseData.promptFeedback?.blockReason) {
 						const detail = responseData.promptFeedback.blockReasonMessage;
 						throw new Error(
 							`Request blocked by Google (${responseData.promptFeedback.blockReason})${detail ? `: ${detail}` : ""}`,
@@ -919,10 +1081,7 @@ function streamGoogleCca(
 										delta: part.text,
 										partial: output,
 									});
-								} else if (
-									isLeakModel &&
-									(isBuffering || part.text.trimStart().startsWith("{"))
-								) {
+								} else if (isLeakModel && (isBuffering || part.text.trimStart().startsWith("{"))) {
 									isBuffering = true;
 									textBuffer += part.text;
 									bufferedSignature = retainThoughtSignature(
@@ -933,18 +1092,14 @@ function streamGoogleCca(
 									if (buffered.kind !== "incomplete") {
 										isBuffering = false;
 										textBuffer = "";
-										const signature = bufferedSignature;
+										const sig = bufferedSignature;
 										bufferedSignature = undefined;
-										emitText(buffered.visibleText, signature);
+										emitText(buffered.visibleText, sig);
 									}
 								} else {
 									emitText(part.text, part.thoughtSignature);
 								}
-							} else if (
-								part.text === "" &&
-								part.thoughtSignature &&
-								!part.functionCall
-							) {
+							} else if (part.text === "" && part.thoughtSignature && !part.functionCall) {
 								if (currentBlock?.type === "thinking") {
 									currentBlock.thinkingSignature = retainThoughtSignature(
 										currentBlock.thinkingSignature,
@@ -964,10 +1119,7 @@ function streamGoogleCca(
 								sawContent = true;
 								const providedId = part.functionCall.id;
 								const needsNewId =
-									!providedId ||
-									output.content.some(
-										(b) => b.type === "toolCall" && b.id === providedId,
-									);
+									!providedId || output.content.some((b) => b.type === "toolCall" && b.id === providedId);
 								const toolCallId = needsNewId
 									? `${part.functionCall.name}_${Date.now()}_${++toolCallCounter}`
 									: providedId;
@@ -975,7 +1127,7 @@ function streamGoogleCca(
 									type: "toolCall" as const,
 									id: toolCallId,
 									name: part.functionCall.name || "",
-									arguments: part.functionCall.args ?? {},
+									arguments: (part.functionCall.args ?? {}) as Record<string, unknown>,
 									...(part.thoughtSignature && {
 										thoughtSignature: part.thoughtSignature,
 									}),
@@ -1004,28 +1156,29 @@ function streamGoogleCca(
 					}
 
 					if (candidate?.finishReason) {
-						output.rawStopReason = candidate.finishReason;
-						output.stopReason = mapStopReasonString(candidate.finishReason);
-						if (
-							output.content.some((b) => b.type === "toolCall") &&
-							output.stopReason === "stop"
-						) {
-							output.stopReason = "toolUse";
-						}
+						flushLeakBuffer();
+						endCurrentBlock();
+						output.stopReason =
+							candidate.finishReason === "STOP"
+								? output.content.some((b) => b.type === "toolCall")
+									? "toolUse"
+									: "stop"
+								: candidate.finishReason === "MAX_TOKENS"
+									? "length"
+									: "error";
 					}
 
 					if (responseData.usageMetadata) {
-						const u = responseData.usageMetadata;
-						const promptTokens = u.promptTokenCount || 0;
-						const cacheRead = u.cachedContentTokenCount || 0;
-						const thinking = u.thoughtsTokenCount || 0;
+						const meta = responseData.usageMetadata;
+						const inputTokens = meta.promptTokenCount ?? 0;
+						const outputTokens = meta.candidatesTokenCount ?? 0;
+						const cacheRead = meta.cachedContentTokenCount ?? 0;
 						output.usage = {
-							input: promptTokens - cacheRead,
-							output: (u.candidatesTokenCount || 0) + thinking,
+							input: inputTokens,
+							output: outputTokens,
 							cacheRead,
 							cacheWrite: 0,
-							totalTokens: u.totalTokenCount || 0,
-							...(thinking > 0 ? { reasoning: thinking } : {}),
+							totalTokens: meta.totalTokenCount ?? inputTokens + outputTokens,
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 						};
 						calculateCost(model, output.usage);
@@ -1034,24 +1187,21 @@ function streamGoogleCca(
 
 				flushLeakBuffer();
 				endCurrentBlock();
-				if (isAntigravity) {
+				if (isAntigravity && lastResponseId) {
 					antigravitySession.lastExecutionId = lastResponseId;
 				}
 				return sawContent;
 			};
 
-			// Endpoint failover (antigravity: daily → sandbox) + bounded retries
-			// for eventless 200s (CCA occasionally returns empty streams).
-			const MAX_EMPTY_RETRIES = 3;
+			// Endpoint failover (antigravity: primary → sandbox)
+			const MAX_EMPTY_RETRIES = 2;
 			let succeeded = false;
-			for (
-				let endpointIndex = 0;
-				endpointIndex < endpoints.length && !succeeded;
-				endpointIndex++
-			) {
+
+			for (let endpointIndex = 0; endpointIndex < endpoints.length && !succeeded; endpointIndex++) {
 				const endpoint = endpoints[endpointIndex]!;
 				const isLastEndpoint = endpointIndex === endpoints.length - 1;
-				for (let attempt = 0; ; attempt++) {
+
+				for (let attempt = 0; attempt <= MAX_EMPTY_RETRIES; attempt++) {
 					if (options?.signal?.aborted) throw new Error("Request was aborted");
 
 					let response: Response;
@@ -1063,8 +1213,16 @@ function streamGoogleCca(
 						);
 					} catch (err) {
 						if (options?.signal?.aborted) throw new Error("Request was aborted");
-						if (!isLastEndpoint && isRetriableTransportError(err)) break; // next endpoint
+						if (!isLastEndpoint && isRetriableTransportError(err)) break; // try fallback endpoint
 						throw err;
+					}
+
+					if (options?.onResponse) {
+						const responseHeaders: Record<string, string> = {};
+						response.headers.forEach((val, key) => {
+							responseHeaders[key] = val;
+						});
+						await options.onResponse({ status: response.status, headers: responseHeaders }, model);
 					}
 
 					if (!response.ok) {
@@ -1077,15 +1235,13 @@ function streamGoogleCca(
 							resetOutput();
 							continue;
 						}
-						if (!isLastEndpoint && isRetriableStatus(response.status)) break; // next endpoint
+						if (!isLastEndpoint && isRetriableStatus(response.status)) break; // try fallback endpoint
 						if (response.status === 429) {
 							throw new Error(
 								`Cloud Code Assist rate limit exceeded (HTTP 429). Check /google-quota for reset times. Upstream: ${errorText}`,
 							);
 						}
-						throw new Error(
-							`Cloud Code Assist API error (${response.status}): ${errorText}`,
-						);
+						throw new Error(`Cloud Code Assist API error (${response.status}): ${errorText}`);
 					}
 
 					let meaningful = false;
@@ -1102,9 +1258,11 @@ function streamGoogleCca(
 					}
 
 					if (output.stopReason !== "pending" || meaningful) {
+						if (isAntigravity) antigravitySession.lastGoodEndpoint = endpoint;
 						succeeded = true;
 						break;
 					}
+
 					if (attempt >= MAX_EMPTY_RETRIES) break;
 					resetOutput();
 				}
@@ -1116,32 +1274,24 @@ function streamGoogleCca(
 					"Cloud Code Assist stream ended without a finish reason (connection dropped or empty response)",
 				);
 			}
-			if (output.stopReason === "error" || output.stopReason === "aborted") {
-				throw new Error(
-					output.errorMessage ||
-						`Generation failed with finish reason: ${output.rawStopReason}`,
-				);
-			}
-			if (output.content.length === 0) {
-				throw new Error("Cloud Code Assist API returned an empty response");
-			}
 
-			// SAFETY: attach extra performance timing metadata to output object
-			(output as unknown as Record<string, unknown>).duration =
-				performance.now() - startTime;
-			if (firstTokenTime) {
-				// SAFETY: attach ttft timing metadata to output object
-				(output as unknown as Record<string, unknown>).ttft =
-					firstTokenTime - startTime;
+			if (output.stopReason === "error" || output.stopReason === "aborted") {
+				stream.push({
+					type: "error",
+					reason: output.stopReason,
+					error: output,
+				});
+			} else {
+				stream.push({
+					type: "done",
+					reason: output.stopReason,
+					message: output,
+				});
 			}
-			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : String(error);
-			// SAFETY: attach extra performance timing metadata to output object
-			(output as unknown as Record<string, unknown>).duration =
-				performance.now() - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -1151,44 +1301,330 @@ function streamGoogleCca(
 }
 
 // ---------------------------------------------------------------------------
-// Registration & Lifecycle: add OAuth to built-in `google` provider, statusline
-// quota tracking, and `/google-quota` command.
+// Static bundled models & Dynamic discovery
+// ---------------------------------------------------------------------------
+
+export const BUNDLED_ANTIGRAVITY_MODELS = [
+	// Gemini 3.x
+	{
+		id: "gemini-3.7-flash",
+		name: "Gemini 3.7 Flash",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_048_576,
+		maxTokens: 65_536,
+	},
+	{
+		id: "gemini-3.7-flash-preview",
+		name: "Gemini 3.7 Flash (Preview)",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_048_576,
+		maxTokens: 65_536,
+	},
+	{
+		id: "gemini-3.5-flash",
+		name: "Gemini 3.5 Flash",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_048_576,
+		maxTokens: 65_536,
+	},
+	{
+		id: "gemini-3.1-pro",
+		name: "Gemini 3.1 Pro",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_048_576,
+		maxTokens: 65_535,
+	},
+	{
+		id: "gemini-3.1-pro-preview",
+		name: "Gemini 3.1 Pro (Preview)",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_048_576,
+		maxTokens: 65_535,
+	},
+	{
+		id: "gemini-3-flash",
+		name: "Gemini 3 Flash",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_048_576,
+		maxTokens: 65_536,
+	},
+	{
+		id: "gemini-3-flash-preview",
+		name: "Gemini 3 Flash (Preview)",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_048_576,
+		maxTokens: 65_536,
+	},
+	{
+		id: "gemini-3-pro",
+		name: "Gemini 3 Pro",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_048_576,
+		maxTokens: 65_535,
+	},
+	// Gemini 2.5
+	{
+		id: "gemini-2.5-flash",
+		name: "Gemini 2.5 Flash",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_048_576,
+		maxTokens: 65_536,
+	},
+	{
+		id: "gemini-2.5-pro",
+		name: "Gemini 2.5 Pro",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_048_576,
+		maxTokens: 65_535,
+	},
+	// Claude on Antigravity
+	{
+		id: "claude-sonnet-4-6",
+		name: "Claude Sonnet 4.6 (Antigravity)",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 64_000,
+	},
+	{
+		id: "claude-opus-4-6",
+		name: "Claude Opus 4.6 (Antigravity)",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 64_000,
+	},
+	{
+		id: "claude-sonnet-4-5",
+		name: "Claude Sonnet 4.5 (Antigravity)",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 64_000,
+	},
+	{
+		id: "claude-opus-4-5",
+		name: "Claude Opus 4.5 (Antigravity)",
+		reasoning: true,
+		input: ["text", "image"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 64_000,
+	},
+	// GPT-OSS on Antigravity
+	{
+		id: "gpt-oss-120b",
+		name: "GPT-OSS 120B (Antigravity)",
+		reasoning: true,
+		input: ["text"] as ("text" | "image")[],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 65_536,
+	},
+];
+
+const DISCOVERY_DENYLIST = new Set(["chat_20706", "chat_23310"]);
+
+export async function fetchAntigravityDynamicModels(
+	accessToken: string,
+	signal?: AbortSignal,
+): Promise<typeof BUNDLED_ANTIGRAVITY_MODELS> {
+	await ensureAntigravityVersion(signal);
+	const headers = {
+		Authorization: `Bearer ${accessToken}`,
+		"Content-Type": "application/json",
+		"User-Agent": antigravityUserAgent(),
+	};
+
+	for (const endpoint of ANTIGRAVITY_ENDPOINTS) {
+		try {
+			const timeoutSignal = AbortSignal.timeout(10_000);
+			const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+			const res = await fetch(`${endpoint}/v1internal:fetchAvailableModels`, {
+				method: "POST",
+				headers,
+				body: JSON.stringify({}),
+				signal: combinedSignal,
+			});
+
+			if (!res.ok) continue;
+
+			const data = (await res.json()) as {
+				models?: Record<
+					string,
+					{
+						displayName?: string;
+						supportsImages?: boolean;
+						supportsThinking?: boolean;
+						maxTokens?: number;
+						maxOutputTokens?: number;
+						isInternal?: boolean;
+					}
+				>;
+			};
+
+			if (!data.models) continue;
+
+			const discovered: typeof BUNDLED_ANTIGRAVITY_MODELS = [];
+			const seenLogical = new Set<string>();
+
+			for (const [rawId, info] of Object.entries(data.models)) {
+				if (DISCOVERY_DENYLIST.has(rawId) || info.isInternal === true) continue;
+
+				// Collapse effort suffix / thinking variants
+				let logicalId = rawId;
+				let logicalName = info.displayName || rawId;
+
+				if (rawId.startsWith("gemini-") && rawId.includes("-flash")) {
+					const m = /^(gemini-\d+(?:\.\d+)?-flash)(?:-(?:low|medium|high|tiered|extra-low))?$/.exec(rawId);
+					if (m) {
+						logicalId = m[1]!;
+						logicalName = logicalId
+							.split("-")
+							.map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+							.join(" ");
+					}
+				} else if (rawId.startsWith("gemini-3.1-pro")) {
+					logicalId = "gemini-3.1-pro";
+					logicalName = "Gemini 3.1 Pro";
+				} else if (rawId === "gemini-pro-agent") {
+					logicalId = "gemini-3.1-pro";
+					logicalName = "Gemini 3.1 Pro";
+				} else if (rawId.startsWith("gemini-3-pro")) {
+					logicalId = "gemini-3-pro";
+					logicalName = "Gemini 3 Pro";
+				} else if (rawId.startsWith("claude-sonnet-4-6")) {
+					logicalId = "claude-sonnet-4-6";
+					logicalName = "Claude Sonnet 4.6 (Antigravity)";
+				} else if (rawId.startsWith("claude-opus-4-6")) {
+					logicalId = "claude-opus-4-6";
+					logicalName = "Claude Opus 4.6 (Antigravity)";
+				} else if (rawId.startsWith("claude-sonnet-4-5")) {
+					logicalId = "claude-sonnet-4-5";
+					logicalName = "Claude Sonnet 4.5 (Antigravity)";
+				} else if (rawId.startsWith("claude-opus-4-5")) {
+					logicalId = "claude-opus-4-5";
+					logicalName = "Claude Opus 4.5 (Antigravity)";
+				} else if (rawId.startsWith("gpt-oss-120b")) {
+					logicalId = "gpt-oss-120b";
+					logicalName = "GPT-OSS 120B (Antigravity)";
+				}
+
+				if (seenLogical.has(logicalId)) continue;
+				seenLogical.add(logicalId);
+
+				const isClaude = isClaudeModel(logicalId);
+				const maxTokens = isClaude ? 64_000 : (info.maxOutputTokens ?? 65_536);
+				const contextWindow = info.maxTokens ?? (isClaude ? 200_000 : 1_048_576);
+
+				discovered.push({
+					id: logicalId,
+					name: logicalName,
+					reasoning: info.supportsThinking ?? true,
+					input: (info.supportsImages ?? true ? ["text", "image"] : ["text"]) as ("text" | "image")[],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow,
+					maxTokens,
+				});
+			}
+
+			// Merge with bundled models to ensure canonical IDs are always present
+			const result = [...discovered];
+			for (const bundled of BUNDLED_ANTIGRAVITY_MODELS) {
+				if (!seenLogical.has(bundled.id)) {
+					result.push(bundled);
+				}
+			}
+			return result;
+		} catch {
+			// Try next endpoint
+		}
+	}
+
+	return BUNDLED_ANTIGRAVITY_MODELS;
+}
+
+// ---------------------------------------------------------------------------
+// Registration & Lifecycle
 // ---------------------------------------------------------------------------
 
 let quotaRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
-async function updateQuotaStatusline(
-	ctx: ExtensionContext,
-	force = false,
-): Promise<void> {
+async function updateQuotaStatusline(ctx: ExtensionContext, force = false): Promise<void> {
 	if (!ctx.hasUI) return;
-	if (ctx.model && ctx.model.provider !== "google") {
-		ctx.ui.setStatus("google-cca", undefined);
-		return;
-	}
 	try {
 		const quota = await getAntigravityQuota(force);
-		const text = formatQuotaStatusline(quota);
-		if (text) {
-			ctx.ui.setStatus("google-cca", text);
-		} else {
-			ctx.ui.setStatus("google-cca", undefined);
-		}
+		const statusText = formatQuotaStatusline(quota);
+		ctx.ui.setStatus("google-cca", statusText ?? undefined);
 	} catch {
-		// Non-fatal if quota cannot be fetched
+		// Non-fatal statusline error
 	}
 }
 
-export default function (pi: ExtensionAPI): void {
+export default async function (pi: ExtensionAPI): Promise<void> {
+	const oauthConfig = {
+		name: "Google (Antigravity)",
+		isSubscription: true,
+		login: loginGoogle,
+		refreshToken: refreshGoogleToken,
+		getApiKey: googleCredentialApiKey,
+	};
+
+	const refreshModelsHandler = async (context: { signal?: AbortSignal }) => {
+		try {
+			const quota = await getAntigravityQuota(false, context.signal);
+			void quota;
+		} catch {
+			// Ignore
+		}
+		return BUNDLED_ANTIGRAVITY_MODELS;
+	};
+
+	// Register built-in "google" provider
 	pi.registerProvider("google", {
 		name: "Google (Cloud Code Assist OAuth)",
 		api: "google-generative-ai",
+		baseUrl: ANTIGRAVITY_PRIMARY_ENDPOINT,
 		streamSimple: streamGoogleCca,
+		models: BUNDLED_ANTIGRAVITY_MODELS,
+		refreshModels: refreshModelsHandler,
+		oauth: oauthConfig,
+	});
+
+	// Also register "google-antigravity" provider
+	pi.registerProvider("google-antigravity", {
+		name: "Google Antigravity",
+		api: "google-generative-ai",
+		baseUrl: ANTIGRAVITY_PRIMARY_ENDPOINT,
+		streamSimple: streamGoogleCca,
+		models: BUNDLED_ANTIGRAVITY_MODELS,
+		refreshModels: refreshModelsHandler,
 		oauth: {
-			name: "Google (Cloud Code Assist)",
-			login: loginGoogle,
-			refreshToken: refreshGoogleToken,
-			getApiKey: googleCredentialApiKey,
+			...oauthConfig,
+			name: "Google Antigravity",
 		},
 	});
 
@@ -1203,7 +1639,7 @@ export default function (pi: ExtensionAPI): void {
 
 	// Refresh statusline after turn ends if Google provider was involved
 	pi.on("turn_end", async (_event, ctx: ExtensionContext) => {
-		if (ctx.model?.provider === "google") {
+		if (ctx.model?.provider === "google" || ctx.model?.provider === "google-antigravity") {
 			invalidateQuotaCache();
 			await updateQuotaStatusline(ctx, true);
 		}
@@ -1211,9 +1647,11 @@ export default function (pi: ExtensionAPI): void {
 
 	// React to model changes
 	pi.on("model_select", async (event, ctx: ExtensionContext) => {
-		if (event.model.provider === "google") {
+		if (event.model.provider === "google" || event.model.provider === "google-antigravity") {
 			await updateQuotaStatusline(ctx);
-		} else if (ctx.hasUI) ctx.ui.setStatus("google-cca", undefined);
+		} else if (ctx.hasUI) {
+			ctx.ui.setStatus("google-cca", undefined);
+		}
 	});
 
 	// Clean up background timer on session shutdown

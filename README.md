@@ -1,51 +1,62 @@
-# Google Cloud Code Assist OAuth for pi
+# Google Cloud Code Assist & Antigravity OAuth for pi
 
-Adds omp-style browser OAuth login to pi's built-in **`google`** provider.
-No models are registered — pi's own google catalog (gemini-2.5-flash,
-gemini-3.7-flash, …) is kept exactly as-is; only authentication and streaming
-are replaced.
+Adds browser OAuth login and full support for Google Antigravity & Cloud Code Assist models to pi (`@earendil-works/pi-coding-agent`).
 
-## What it does
+Supports **Gemini 3.x/2.5**, **Anthropic Claude (Sonnet 4.6, Opus 4.6, Sonnet 4.5, Opus 4.5)**, and **OpenAI GPT-OSS (120B)** through your Google subscription/OAuth grant, with dynamic model discovery, thinking config, and live quota tracking.
 
-- `/login google` runs the same flow as the omp CLI (ported from
-  `oh-my-pi/packages/ai/src/registry/oauth/`):
-  1. Client picker: **Antigravity** (`daily-cloudcode-pa.googleapis.com`,
-     newest Gemini models) or **Gemini CLI** (`cloudcode-pa.googleapis.com`).
-  2. Browser authorization-code flow against Google, received by a loopback
-     callback server (`127.0.0.1:8085` / `:51121`, dual-stack, random-port
-     fallback, CSRF state, 5-minute wait). `access_type=offline` +
-     `prompt=consent` guarantee a refresh token.
-  3. Token exchange → account email → Cloud Code Assist project discovery
-     (`loadCodeAssist` / `onboardUser` + LRO polling, free-tier provisioning).
-- Requests stream through the Cloud Code Assist wire protocol
-  (`POST {endpoint}/v1internal:streamGenerateContent?alt=sse`, `{project,
-  model, request}` envelope) with the OAuth access token instead of the
-  Generative Language API + API key. Antigravity requests carry the real hub
-  client's envelope (sessionId, requestId, labels, effort-routed wire model
-  ids, `VALIDATED` tool mode, fixed output caps).
-- Tokens refresh automatically before expiry (`oauth.refreshToken` hook); the
-  grant's client variant and Cloud project id persist in
-  `~/.pi/agent/auth.json`.
-- Tool schemas are normalized for the proto-backed wire schema (port of omp's
-  `normalizeSchemaForGoogle` subset) so MCP tool annotations (`deprecated`,
-  `$defs`, validation keywords, non-string enums) don't 400 the request.
-- Gemini-Flash planning-leak guard and thought-signature retention are ported
-  from omp's google-gemini-cli provider.
+## Features
+
+- **OAuth Authentication**:
+  - `/login google` or `/login google-antigravity` runs browser authorization against Google.
+  - Automatic loopback server (`127.0.0.1:51121` / `127.0.0.1:8085`) and manual code entry support.
+  - Auto-provisioning for the Antigravity free tier (`onboardUser` + project discovery).
+  - Background token refresh before expiry.
+  - Subscription status marked with `isSubscription: true`.
+
+- **All Antigravity Models Supported**:
+  - **Gemini**: `gemini-3.7-flash`, `gemini-3.5-flash`, `gemini-3.1-pro`, `gemini-3-flash`, `gemini-3-pro`, `gemini-2.5-flash`, `gemini-2.5-pro`.
+  - **Anthropic Claude via Antigravity**: `claude-sonnet-4-6`, `claude-opus-4-6`, `claude-sonnet-4-5`, `claude-opus-4-5` (with 64,000 output token limit capping and `anthropic-beta: interleaved-thinking-2025-05-14` header).
+  - **OpenAI GPT-OSS via Antigravity**: `gpt-oss-120b`.
+  - **Dynamic Discovery**: Automatically discovers any newly released models via `/v1internal:fetchAvailableModels` and collapses effort-tier variants.
+
+- **Wire-Format & Schema Normalization Fixes**:
+  - Unsigned first function call sentinel (`skip_thought_signature_validator`) to prevent Gemini 3+ tool-calling errors.
+  - Full proto JSON Schema normalization stripping `anyOf`, `oneOf`, `allOf`, `not`, `$schema`, `additionalProperties`, and `patternProperties` to avoid `INVALID_ARGUMENT: Cannot find field` errors.
+  - System instructions sent with `role: "user"` as required by Antigravity.
+  - Claude models automatically configure `VALIDATED` tool mode.
+  - Multi-endpoint failover across `daily-cloudcode-pa.googleapis.com` and `daily-cloudcode-pa.sandbox.googleapis.com`.
+  - Flash planning leak filter and thought-signature preservation across turns.
+
+- **Live Quota & Rate-Limit Tracking**:
+  - Statusline display showing 5-hour and weekly window capacities (e.g. `🪐 Antigravity: 5h 93% (4h27m) · Wk 77% (3d8h)`).
+  - `/google-quota` command for detailed quota breakdown and reset countdowns.
 
 ## Usage
 
-```bash
-/login google        # browser OAuth; pick Antigravity or Gemini CLI client
---provider google --model gemini-3.7-flash ...
-```
+1. **Log in with your Google account**:
+   ```bash
+   /login google
+   ```
+   Choose **Antigravity** (for Gemini 3.x, Claude, and GPT-OSS models) or **Gemini CLI**.
 
-Note: after `/login google`, the stored OAuth credential replaces any AI
-Studio API key for the `google` provider, and all google-provider traffic goes
-through Cloud Code Assist. To go back to an API key, remove the `google` entry
-from `~/.pi/agent/auth.json` and restart pi.
+2. **Select and use models**:
+   ```bash
+   /model gemini-3.7-flash
+   /model claude-sonnet-4-6
+   /model claude-opus-4-6
+   /model gemini-3.1-pro
+   /model gpt-oss-120b
+   ```
+
+3. **Check remaining quota**:
+   ```bash
+   /google-quota
+   /google-quota refresh
+   ```
 
 ## Files
 
-- `index.ts` — provider override (`registerProvider("google", { oauth, streamSimple })`)
-- `oauth.ts` — login/refresh flows, callback server, project discovery
-- `google-wire.ts` — message/tool converters + wire-schema normalization
+- `extensions/index.ts` — Provider registration (`google` & `google-antigravity`), request building, SSE streaming, model catalog, and lifecycle hooks.
+- `extensions/oauth.ts` — Google OAuth flow, PKCE callback server, dynamic Antigravity client versioning, project discovery, and token refresh.
+- `extensions/google-wire.ts` — Wire-format message converters, thought signature preservation, and proto-backed JSON Schema normalization (`normalizeSchemaForCCA`).
+- `extensions/quota.ts` — Antigravity quota discovery (`retrieveUserQuotaSummary`), statusline renderer, and `/google-quota` banner.

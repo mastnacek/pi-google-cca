@@ -1,17 +1,6 @@
 /**
- * Google wire-format converters, ported from pi-ai's
- * dist/api/{google-shared,transform-messages}.js and omp's google-shared.ts.
- *
- * These live here because the extension runtime only aliases the pi-ai root
- * entrypoint (`@earendil-works/pi-ai` → dist/compat.js) — subpath imports
- * like `@earendil-works/pi-ai/api/google-shared` do not resolve. Porting the
- * converters keeps the extension self-contained and binary-safe.
- *
- * Behavior mirrors pi-ai: thought-signature retention (same provider+model
- * only, base64-validated), Cloud Code Assist's single-user-turn function
- * responses, Gemini 3 tool-call ids, multimodal function responses, image
- * downgrades for non-vision models, and synthetic tool results for orphaned
- * tool calls.
+ * Google wire-format converters and JSON Schema normalization for Cloud Code Assist / Antigravity.
+ * Ported from pi-ai and oh-my-pi implementations.
  */
 import type {
 	Context,
@@ -110,7 +99,7 @@ function supportsMultimodalFunctionResponse(modelId: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// transformMessages (pi-ai port)
+// transformMessages
 // ---------------------------------------------------------------------------
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER =
@@ -167,7 +156,7 @@ function downgradeUnsupportedImages(
 	});
 }
 
-/** Minimal structural type the converters need from a model (avoiding pi-ai generics). */
+/** Minimal structural type the converters need from a model. */
 export interface ModelWire {
 	id: string;
 	provider: string;
@@ -204,7 +193,7 @@ export function transformMessages(
 			};
 			const isSameModel =
 				assistantMsg.provider === model.provider &&
-				assistantMsg.api === model.api &&
+				(!assistantMsg.api || assistantMsg.api === model.api) &&
 				assistantMsg.model === model.id;
 			const transformedContent = (assistantMsg.content as AnyContent[]).flatMap(
 				(block) => {
@@ -226,7 +215,6 @@ export function transformMessages(
 						return [{ type: "text", text: block.text ?? "" }];
 					}
 					if (block.type === "toolCall") {
-						// SAFETY: block type narrowed to toolCall
 						const toolCall = block as unknown as ToolCall;
 						let normalized: unknown = toolCall;
 						if (!isSameModel && toolCall.thoughtSignature) {
@@ -283,7 +271,6 @@ export function transformMessages(
 				assistantMsg.stopReason === "aborted"
 			)
 				continue;
-			// SAFETY: content array is filtered to toolCall blocks
 			const toolCalls = (assistantMsg.content as AnyContent[]).filter(
 				(b) => b.type === "toolCall",
 			) as unknown as ToolCall[];
@@ -301,7 +288,7 @@ export function transformMessages(
 			insertSyntheticToolResults();
 			result.push(msg as Message);
 		} else {
-			result.push(msg as Message);
+			result.push(msg);
 		}
 	}
 	insertSyntheticToolResults();
@@ -309,15 +296,15 @@ export function transformMessages(
 }
 
 // ---------------------------------------------------------------------------
-// convertMessages (pi-ai google-shared port, CCA flavor)
+// convertMessages (pi-ai / omp google-shared port, CCA flavor)
 // ---------------------------------------------------------------------------
 
 const base64SignaturePattern = /^[A-Za-z0-9+/]+={0,2}$/;
+export const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
 
 function isValidThoughtSignature(signature: string | undefined): boolean {
 	if (!signature) return false;
-	if (signature.length % 4 !== 0) return false;
-	return base64SignaturePattern.test(signature);
+	return signature === SKIP_THOUGHT_SIGNATURE || base64SignaturePattern.test(signature);
 }
 
 function resolveThoughtSignature(
@@ -371,6 +358,8 @@ export function convertMessages(
 			const parts: GeminiPart[] = [];
 			const isSameProviderAndModel =
 				assistantMsg.provider === model.provider && assistantMsg.model === model.id;
+			let isFirstToolCall = true;
+
 			for (const block of assistantMsg.content as AnyContent[]) {
 				if (block.type === "text") {
 					const text = block as {
@@ -382,7 +371,6 @@ export function convertMessages(
 						isSameProviderAndModel,
 						text.textSignature,
 					);
-					// Keep empty text blocks only when they carry a thought signature.
 					if ((!text.text || text.text.trim() === "") && !thoughtSignature) continue;
 					parts.push({
 						text: sanitizeSurrogates(text.text),
@@ -414,19 +402,24 @@ export function convertMessages(
 						parts.push({ text: sanitizeSurrogates(thinking.thinking) });
 					}
 				} else if (block.type === "toolCall") {
-					// SAFETY: block type narrowed to toolCall
 					const toolCall = block as unknown as ToolCall;
 					const thoughtSignature = resolveThoughtSignature(
 						isSameProviderAndModel,
 						toolCall.thoughtSignature,
 					);
+					// Cloud Code Assist rejects an unsigned first function call on Gemini 3+ / CCA models.
+					// Use SKIP_THOUGHT_SIGNATURE sentinel if no signature is present on the first tool call.
+					const effectiveSignature =
+						thoughtSignature || (isFirstToolCall ? SKIP_THOUGHT_SIGNATURE : undefined);
+					isFirstToolCall = false;
+
 					parts.push({
 						functionCall: {
 							name: toolCall.name,
-							args: toolCall.arguments ?? {},
+							args: (toolCall.arguments ?? {}) as Record<string, unknown>,
 							...(needsId && { id: toolCall.id }),
 						},
-						...(thoughtSignature && { thoughtSignature }),
+						...(effectiveSignature && { thoughtSignature: effectiveSignature }),
 					});
 				}
 			}
@@ -493,17 +486,17 @@ export function convertMessages(
 }
 
 // ---------------------------------------------------------------------------
-// Wire-schema normalization (ported subset of omp's normalizeSchemaForGoogle:
+// Wire-schema normalization (normalizeSchemaForCCA)
 // Cloud Code Assist maps tool schemas onto a proto Schema that rejects most
 // validation/annotation keywords with INVALID_ARGUMENT "Cannot find field",
-// and proto enums are strings only).
+// and proto enums are strings only without anyOf/oneOf combiners.
 // ---------------------------------------------------------------------------
 
-/** Keywords omp strips from Google wire schemas (utils/schema/fields.ts). */
 const UNSUPPORTED_FIELDS = new Set([
 	"$schema",
 	"$ref",
 	"$defs",
+	"definitions",
 	"$dynamicRef",
 	"$dynamicAnchor",
 	"examples",
@@ -532,8 +525,6 @@ const UNSUPPORTED_FIELDS = new Set([
 	"readOnly",
 	"writeOnly",
 	"$comment",
-	// Not in omp's list, but the proto Schema has no field for these either;
-	// stripping them keeps the schema permissive instead of erroring.
 	"if",
 	"then",
 	"else",
@@ -551,7 +542,7 @@ function isNullSchema(node: Record<string, unknown>): boolean {
 	return false;
 }
 
-function stringifyEnumValues(values: unknown[]): unknown[] {
+function stringifyEnumValues(values: unknown[]): string[] {
 	return values.map((v) =>
 		v === null
 			? "null"
@@ -582,16 +573,22 @@ function dereference(
 	if (Array.isArray(value))
 		return value.map((v) => dereference(v, defs, seen, depth + 1));
 	if (typeof value !== "object" || value === null) {
-		// SAFETY: non-object primitive value
 		return value as NormalizedSchemaNode;
 	}
 	if (seen.has(value)) return {};
 	seen.add(value);
 	const record = value as Record<string, unknown>;
 	const ref = record.$ref;
-	if (typeof ref === "string" && ref.startsWith("#/$defs/")) {
-		const target = defs.get(ref.slice("#/$defs/".length));
-		return target === undefined ? {} : dereference(target, defs, seen, depth + 1);
+	if (typeof ref === "string") {
+		const defName = ref.startsWith("#/$defs/")
+			? ref.slice("#/$defs/".length)
+			: ref.startsWith("#/definitions/")
+				? ref.slice("#/definitions/".length)
+				: undefined;
+		if (defName !== undefined) {
+			const target = defs.get(defName);
+			return target === undefined ? {} : dereference(target, defs, seen, depth + 1);
+		}
 	}
 	const out: Record<string, unknown> = {};
 	for (const [key, v] of Object.entries(record)) {
@@ -601,24 +598,91 @@ function dereference(
 	return out;
 }
 
-function normalizeNode(value: unknown): NormalizedSchemaNode {
-	// Boolean subschemas: true → permissive {}; false degraded to permissive too
-	// (the constraint is lost but the request no longer 400s).
+/**
+ * Normalizes a schema node for Cloud Code Assist's proto-backed parameters schema.
+ * Merges object combiners, removes anyOf/oneOf/allOf/not, converts enums to string,
+ * and strips unsupported keywords.
+ */
+function normalizeCcaNode(value: unknown): NormalizedSchemaNode {
 	if (typeof value === "boolean") return {};
 	if (typeof value !== "object" || value === null) {
-		// SAFETY: non-object primitive value
 		return value as NormalizedSchemaNode;
 	}
-	if (Array.isArray(value)) return value.map(normalizeNode);
+	if (Array.isArray(value)) return value.map(normalizeCcaNode);
 
 	const record = value as Record<string, unknown>;
+
+	// Handle anyOf / oneOf / allOf composition
+	const combiners = ["anyOf", "oneOf", "allOf"] as const;
+	for (const combiner of combiners) {
+		const rawBranches = record[combiner];
+		if (Array.isArray(rawBranches) && rawBranches.length > 0) {
+			const nonNullBranches = rawBranches
+				.map(normalizeCcaNode)
+				.filter(
+					(b): b is Record<string, unknown> =>
+						typeof b === "object" && b !== null && !isNullSchema(b as Record<string, unknown>),
+				);
+
+			if (nonNullBranches.length === 0) {
+				return { type: "null" };
+			}
+
+			// If any branch is an object, merge properties from all object branches
+			const objectBranches = nonNullBranches.filter(
+				(b) => b.type === "object" || b.properties !== undefined,
+			);
+			if (objectBranches.length > 0) {
+				const mergedProps: Record<string, unknown> = {};
+				const mergedRequired: Set<string> = new Set();
+				let description: string | undefined =
+					typeof record.description === "string" ? record.description : undefined;
+
+				for (const branch of objectBranches) {
+					if (typeof branch.description === "string" && !description) {
+						description = branch.description;
+					}
+					if (typeof branch.properties === "object" && branch.properties !== null) {
+						for (const [k, v] of Object.entries(branch.properties as Record<string, unknown>)) {
+							mergedProps[k] = v;
+						}
+					}
+					if (Array.isArray(branch.required)) {
+						for (const req of branch.required) {
+							if (typeof req === "string") mergedRequired.add(req);
+						}
+					}
+				}
+
+				const outObj: Record<string, unknown> = {
+					type: "object",
+					properties: mergedProps,
+				};
+				if (mergedRequired.size > 0) {
+					outObj.required = Array.from(mergedRequired);
+				}
+				if (description) {
+					outObj.description = description;
+				}
+				return outObj;
+			}
+
+			// For scalar branches, pick the first non-null branch
+			const primary = nonNullBranches[0]!;
+			const outScalar: Record<string, unknown> = { ...primary };
+			if (typeof record.description === "string") {
+				outScalar.description = record.description;
+			}
+			return normalizeCcaNode(outScalar);
+		}
+	}
+
 	const out: Record<string, unknown> = {};
 
 	for (const [key, raw] of Object.entries(record)) {
 		if (UNSUPPORTED_FIELDS.has(key)) continue;
 
 		if (key === "type") {
-			// type arrays (e.g. ["string","null"]) → single non-null scalar type.
 			if (Array.isArray(raw)) {
 				const nonNull = raw.filter((t) => t !== "null");
 				out.type =
@@ -636,22 +700,7 @@ function normalizeNode(value: unknown): NormalizedSchemaNode {
 			if (Array.isArray(raw)) out.enum = stringifyEnumValues(raw);
 			continue;
 		}
-		if (key === "anyOf" || key === "oneOf") {
-			const branches = Array.isArray(raw) ? raw.map(normalizeNode) : [];
-			const nonNull = branches.filter(
-				(b) =>
-					!(
-						typeof b === "object" &&
-						b !== null &&
-						isNullSchema(b as Record<string, unknown>)
-					),
-			);
-			if (nonNull.length === 0) out.type = "null";
-			else out[key] = nonNull;
-			continue;
-		}
 		if (key === "const") {
-			// proto Schema has no const; express as a single-value string enum.
 			out.enum = stringifyEnumValues([raw]);
 			continue;
 		}
@@ -660,31 +709,35 @@ function normalizeNode(value: unknown): NormalizedSchemaNode {
 			for (const [name, schema] of Object.entries(
 				raw as Record<string, unknown>,
 			)) {
-				props[name] = normalizeNode(schema);
+				props[name] = normalizeCcaNode(schema);
 			}
 			out.properties = props;
 			continue;
 		}
 		if (key === "items") {
-			out.items = normalizeNode(raw);
+			out.items = normalizeCcaNode(raw);
 			continue;
 		}
-		// description / title / default / required / uniqueItems / … pass through.
+		if (key === "required" && Array.isArray(raw)) {
+			out.required = raw.filter((item): item is string => typeof item === "string");
+			continue;
+		}
 		out[key] = raw;
 	}
 
-	// Bare enum without a type: proto needs the scalar type (omp inferTypeForBareEnum).
+	// Bare enum without a type: proto needs the scalar type
 	if (out.enum !== undefined && out.type === undefined) out.type = "string";
+
 	return out;
 }
 
-/** Normalize a tool schema for the Cloud Code Assist wire (omp normalizeSchemaForGoogle subset). */
-export function normalizeSchemaForWire(value: unknown): NormalizedSchemaNode {
-	// Collect $defs from the root for dereferencing, then normalize.
+/** Normalize a tool schema for Cloud Code Assist wire parameters. */
+export function normalizeSchemaForCCA(value: unknown): Record<string, unknown> {
 	const root =
 		typeof value === "object" && value !== null && !Array.isArray(value)
 			? (value as Record<string, unknown>)
 			: {};
+
 	const defs = new Map<string, unknown>();
 	for (const defKey of ["$defs", "definitions"]) {
 		const defContainer = root[defKey];
@@ -696,8 +749,19 @@ export function normalizeSchemaForWire(value: unknown): NormalizedSchemaNode {
 			}
 		}
 	}
+
 	const dereferenced = dereference(value, defs, new Set(), 0);
-	return normalizeNode(dereferenced);
+	const normalized = normalizeCcaNode(dereferenced);
+
+	if (typeof normalized === "object" && normalized !== null && !Array.isArray(normalized)) {
+		const obj = normalized as Record<string, unknown>;
+		if (!obj.type && obj.properties) {
+			obj.type = "object";
+		}
+		return obj;
+	}
+
+	return { type: "object", properties: {} };
 }
 
 // ---------------------------------------------------------------------------
@@ -707,24 +771,22 @@ export function normalizeSchemaForWire(value: unknown): NormalizedSchemaNode {
 export interface FunctionDeclaration {
 	name: string;
 	description: string;
-	parametersJsonSchema: unknown;
+	parameters: Record<string, unknown>;
 }
 
 /**
- * Tools → Gemini functionDeclarations with `parametersJsonSchema` (the CCA
- * path omp uses for Gemini models), normalized for the proto-backed wire
- * schema.
+ * Tools → Gemini functionDeclarations with normalized `parameters` for Cloud Code Assist.
  */
 export function convertTools(
 	tools: Tool[],
 ): { functionDeclarations: FunctionDeclaration[] }[] {
-	if (tools.length === 0) return [];
+	if (!tools || tools.length === 0) return [];
 	return [
 		{
 			functionDeclarations: tools.map((tool) => ({
 				name: tool.name,
 				description: tool.description || "",
-				parametersJsonSchema: normalizeSchemaForWire(tool.parameters),
+				parameters: normalizeSchemaForCCA(tool.parameters),
 			})),
 		},
 	];
