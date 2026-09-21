@@ -1172,14 +1172,16 @@ function streamGoogleCca(
 					if (candidate?.finishReason) {
 						flushLeakBuffer();
 						endCurrentBlock();
-						output.stopReason =
-							candidate.finishReason === "STOP"
-								? output.content.some((b) => b.type === "toolCall")
-									? "toolUse"
-									: "stop"
-								: candidate.finishReason === "MAX_TOKENS"
-									? "length"
-									: "error";
+						if (candidate.finishReason === "STOP") {
+							output.stopReason = output.content.some((b) => b.type === "toolCall")
+								? "toolUse"
+								: "stop";
+						} else if (candidate.finishReason === "MAX_TOKENS") {
+							output.stopReason = "length";
+						} else {
+							output.stopReason = "error";
+							output.errorMessage = `Generation failed with finish reason: ${candidate.finishReason}`;
+						}
 					}
 
 					if (responseData.usageMetadata) {
@@ -1271,7 +1273,17 @@ function streamGoogleCca(
 						throw err;
 					}
 
-					if (output.stopReason !== "pending" || meaningful) {
+					if (
+						output.stopReason === "error" &&
+						output.errorMessage?.includes("MALFORMED_FUNCTION_CALL") &&
+						attempt < MAX_EMPTY_RETRIES
+					) {
+						await sleep(RETRY_BASE_DELAY_MS * 2 ** attempt, options?.signal);
+						resetOutput();
+						continue;
+					}
+
+					if ((output.stopReason !== "pending" && output.stopReason !== "error") || meaningful) {
 						if (isAntigravity) antigravitySession.lastGoodEndpoint = endpoint;
 						succeeded = true;
 						break;
