@@ -362,7 +362,6 @@ export function convertMessages(
 			const parts: GeminiPart[] = [];
 			const isSameProviderAndModel =
 				assistantMsg.provider === model.provider && assistantMsg.model === model.id;
-			let isFirstToolCall = true;
 
 			for (const block of assistantMsg.content as AnyContent[]) {
 				if (block.type === "text") {
@@ -406,16 +405,15 @@ export function convertMessages(
 						parts.push({ text: sanitizeSurrogates(thinking.thinking) });
 					}
 				} else if (block.type === "toolCall") {
+					// SAFETY: we verified the block type
 					const toolCall = block as unknown as ToolCall;
 					const thoughtSignature = resolveThoughtSignature(
 						isSameProviderAndModel,
 						toolCall.thoughtSignature,
 					);
-					// Cloud Code Assist rejects an unsigned first function call on Gemini 3+ / CCA models.
-					// Use SKIP_THOUGHT_SIGNATURE sentinel if no signature is present on the first tool call.
+					// Cloud Code Assist rejects unsigned function calls on Gemini models.
 					const effectiveSignature =
-						thoughtSignature || (isFirstToolCall ? SKIP_THOUGHT_SIGNATURE : undefined);
-					isFirstToolCall = false;
+						thoughtSignature || (!isSameProviderAndModel ? SKIP_THOUGHT_SIGNATURE : undefined);
 
 					parts.push({
 						functionCall: {
