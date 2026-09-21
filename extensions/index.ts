@@ -597,9 +597,17 @@ function buildCcaRequest(
 
 	if (context.tools && context.tools.length > 0) {
 		request.tools = convertTools(context.tools);
-		if (isAntigravity) {
-			request.toolConfig = { functionCallingConfig: { mode: "VALIDATED" } };
-		}
+	}
+	
+	const toolChoice = (options as any)?.toolChoice;
+	if (toolChoice && toolChoice !== "auto" && toolChoice !== "Auto") {
+		let mode: "AUTO" | "ANY" | "NONE" | "VALIDATED" = "AUTO";
+		const tc = String(toolChoice).toLowerCase();
+		if (tc === "none") mode = "NONE";
+		else if (tc === "any" || tc === "required") mode = "ANY";
+		request.toolConfig = {
+			functionCallingConfig: { mode },
+		};
 	}
 
 	// Claude on Antigravity always forces VALIDATED tool mode, even with no tools declared
