@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import * as assert from "node:assert";
-import type { Context, Tool, Model, Api } from "@earendil-works/pi-ai";
+import type { Context, Tool } from "@earendil-works/pi-ai";
 import {
 	convertMessages,
 	convertTools,
@@ -21,7 +21,6 @@ import {
 } from "../extensions/quota.ts";
 import {
 	BUNDLED_ANTIGRAVITY_MODELS,
-	fetchAntigravityDynamicModels,
 } from "../extensions/index.ts";
 
 describe("Antigravity OAuth & Wire tests", () => {
@@ -268,11 +267,17 @@ describe("Antigravity OAuth & Wire tests", () => {
 		it("includes all expected Gemini, Claude, and GPT-OSS models", () => {
 			const ids = new Set(BUNDLED_ANTIGRAVITY_MODELS.map((m) => m.id));
 			assert.ok(ids.has("gemini-3.7-flash"));
+			assert.ok(ids.has("gemini-3.8-flash"));
+			assert.ok(ids.has("gemini-3.6-flash"));
 			assert.ok(ids.has("gemini-3.5-flash"));
+			assert.ok(ids.has("gemini-3.5-flash-lite"));
+			assert.ok(ids.has("gemini-3.1-flash-lite"));
 			assert.ok(ids.has("gemini-3.1-pro"));
 			assert.ok(ids.has("gemini-3-flash"));
 			assert.ok(ids.has("gemini-3-pro"));
 			assert.ok(ids.has("gemini-2.5-flash"));
+			assert.ok(ids.has("gemini-2.5-flash-lite"));
+			assert.ok(ids.has("gemini-2.5-pro"));
 			assert.ok(ids.has("claude-sonnet-4-6"));
 			assert.ok(ids.has("claude-opus-4-6"));
 			assert.ok(ids.has("claude-sonnet-4-5"));
@@ -285,6 +290,15 @@ describe("Antigravity OAuth & Wire tests", () => {
 			const opus = BUNDLED_ANTIGRAVITY_MODELS.find((m) => m.id === "claude-opus-4-6");
 			assert.strictEqual(sonnet?.maxTokens, 64_000);
 			assert.strictEqual(opus?.maxTokens, 64_000);
+		});
+
+		it("has accurate context window sizes matching oh-my-pi", () => {
+			const sonnet45 = BUNDLED_ANTIGRAVITY_MODELS.find((m) => m.id === "claude-sonnet-4-5");
+			const sonnet46 = BUNDLED_ANTIGRAVITY_MODELS.find((m) => m.id === "claude-sonnet-4-6");
+			const geminiFlash = BUNDLED_ANTIGRAVITY_MODELS.find((m) => m.id === "gemini-3.7-flash");
+			assert.strictEqual(sonnet45?.contextWindow, 1_000_000);
+			assert.strictEqual(sonnet46?.contextWindow, 250_000);
+			assert.strictEqual(geminiFlash?.contextWindow, 1_048_576);
 		});
 	});
 
