@@ -215,6 +215,7 @@ export function transformMessages(
 						return [{ type: "text", text: block.text ?? "" }];
 					}
 					if (block.type === "toolCall") {
+						// SAFETY: we verified the block type
 						const toolCall = block as unknown as ToolCall;
 						let normalized: unknown = toolCall;
 						if (!isSameModel && toolCall.thoughtSignature) {
@@ -271,6 +272,8 @@ export function transformMessages(
 				assistantMsg.stopReason === "aborted"
 			)
 				continue;
+			
+			// SAFETY: we filter by type toolCall
 			const toolCalls = (assistantMsg.content as AnyContent[]).filter(
 				(b) => b.type === "toolCall",
 			) as unknown as ToolCall[];
@@ -429,11 +432,33 @@ export function convertMessages(
 			contents.push({ role: "model", parts });
 		} else if (msg.role === "toolResult") {
 			const toolResult = msg as Message & {
-				toolName: string;
-				toolCallId: string;
+				toolName?: string;
+				name?: string;
+				toolCallId?: string;
+				id?: string;
 				isError?: boolean;
 				content: AnyContent[];
 			};
+			
+			let toolName = toolResult.toolName || toolResult.name;
+			if (!toolName && (toolResult.toolCallId || toolResult.id)) {
+				const targetId = toolResult.toolCallId || toolResult.id;
+				const normTargetId = targetId ? normalizeToolCallId(targetId) : undefined;
+				for (const prev of transformedMessages) {
+					if (prev.role === "assistant" && Array.isArray(prev.content)) {
+						const found = (prev.content as AnyContent[]).find(
+							(c) => (c.type === "toolCall" || c.type === "tool_use") && 
+							       (c.id === targetId || (c.id && normTargetId && normalizeToolCallId(c.id as string) === normTargetId))
+						);
+						if (found && typeof found.name === "string") {
+							toolName = found.name;
+							break;
+						}
+					}
+				}
+			}
+
+			const toolCallId = toolResult.toolCallId || toolResult.id || "";
 			const textContent = toolResult.content.filter((c) => c.type === "text");
 			const textResult = textContent.map((c) => c.text ?? "").join("\n");
 			const imageContent = model.input.includes("image")
@@ -455,12 +480,12 @@ export function convertMessages(
 
 			const functionResponsePart: GeminiPart = {
 				functionResponse: {
-					name: toolResult.toolName,
+					name: toolName || "unknown_tool",
 					response: toolResult.isError
 						? { error: responseValue }
 						: { output: responseValue },
 					...(hasImages && multimodal && { parts: imageParts }),
-					...(needsId && { id: toolResult.toolCallId }),
+					...(needsId && { id: toolCallId }),
 				},
 			};
 
