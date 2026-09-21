@@ -1,6 +1,6 @@
 {
   "name": "pi-google-cca",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "type": "module",
   "description": "Google Cloud Code Assist & Antigravity OAuth for pi — browser OAuth login for Google & Antigravity models (Gemini 3.x/2.5, Claude Sonnet/Opus 4.6/4.5, GPT-OSS 120B), streaming via the Cloud Code Assist wire API with quota tracking and dynamic model discovery.",
   "keywords": [

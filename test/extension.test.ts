@@ -21,6 +21,9 @@ import {
 } from "../extensions/quota.ts";
 import {
 	BUNDLED_ANTIGRAVITY_MODELS,
+	ANTIGRAVITY_MODEL_ROUTING,
+	ANTIGRAVITY_WIRE_PROFILES,
+	antigravityWireModelId,
 } from "../extensions/index.ts";
 
 describe("Antigravity OAuth & Wire tests", () => {
@@ -299,6 +302,22 @@ describe("Antigravity OAuth & Wire tests", () => {
 			assert.strictEqual(sonnet45?.contextWindow, 1_000_000);
 			assert.strictEqual(sonnet46?.contextWindow, 250_000);
 			assert.strictEqual(geminiFlash?.contextWindow, 1_048_576);
+		});
+
+		it("routes gemini-3.7-flash and gemini-3.8-flash to valid tiered wire models", () => {
+			assert.strictEqual(antigravityWireModelId("gemini-3.7-flash", "low"), "gemini-3.7-flash-tiered");
+			assert.strictEqual(antigravityWireModelId("gemini-3.7-flash", "medium"), "gemini-3.7-flash-tiered");
+			assert.strictEqual(antigravityWireModelId("gemini-3.7-flash", "high"), "gemini-3.7-flash-tiered");
+			assert.strictEqual(antigravityWireModelId("gemini-3.8-flash", "medium"), "gemini-3.8-flash-tiered");
+			assert.strictEqual(antigravityWireModelId("gemini-3.6-flash", "high"), "gemini-3.6-flash-high");
+			assert.strictEqual(antigravityWireModelId("gemini-3.6-flash", "low"), "gemini-3.6-flash-low");
+		});
+
+		it("maps wire profiles for all routed models with valid modelEnums", () => {
+			assert.strictEqual(ANTIGRAVITY_WIRE_PROFILES["gemini-3.7-flash-tiered"]?.modelEnum, "MODEL_PLACEHOLDER_M301");
+			assert.strictEqual(ANTIGRAVITY_WIRE_PROFILES["gemini-3.8-flash-tiered"]?.modelEnum, "MODEL_PLACEHOLDER_M322");
+			assert.strictEqual(ANTIGRAVITY_WIRE_PROFILES["gemini-3.6-flash-tiered"]?.modelEnum, "MODEL_PLACEHOLDER_M196");
+			assert.strictEqual(ANTIGRAVITY_WIRE_PROFILES["gemini-3.6-flash-high"]?.modelEnum, "MODEL_PLACEHOLDER_M71");
 		});
 	});
 
