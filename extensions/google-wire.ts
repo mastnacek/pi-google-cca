@@ -513,294 +513,75 @@ export function convertMessages(
 }
 
 // ---------------------------------------------------------------------------
-// Wire-schema normalization (normalizeSchemaForCCA)
+// Wire-schema normalization (normalizeCustomToolSchema)
 // Cloud Code Assist maps tool schemas onto a proto Schema that rejects most
 // validation/annotation keywords with INVALID_ARGUMENT "Cannot find field",
-// and proto enums are strings only without anyOf/oneOf combiners.
+// and proto enums are strings only.
 // ---------------------------------------------------------------------------
 
-const UNSUPPORTED_FIELDS = new Set([
-	"$schema",
-	"$ref",
-	"$defs",
-	"definitions",
-	"$dynamicRef",
-	"$dynamicAnchor",
-	"examples",
-	"prefixItems",
-	"unevaluatedProperties",
-	"unevaluatedItems",
-	"patternProperties",
-	"additionalProperties",
-	"propertyNames",
-	"minItems",
-	"maxItems",
-	"minLength",
-	"maxLength",
-	"minimum",
-	"maximum",
-	"exclusiveMinimum",
-	"exclusiveMaximum",
-	"multipleOf",
-	"pattern",
-	"format",
-	"dependencies",
-	"dependentSchemas",
-	"dependentRequired",
-	"x-mcp-header",
-	"deprecated",
-	"readOnly",
-	"writeOnly",
-	"$comment",
-	"if",
-	"then",
-	"else",
-	"not",
+const CUSTOM_TOOL_SCHEMA_ALLOW = new Set([
+	"type",
+	"description",
+	"properties",
+	"required",
+	"items",
+	"enum",
 ]);
 
-function isNullSchema(node: Record<string, unknown>): boolean {
-	if (node.type === "null") return true;
-	if (
-		Array.isArray(node.enum) &&
-		node.enum.length === 1 &&
-		node.enum[0] === null
-	)
-		return true;
-	return false;
-}
-
-function stringifyEnumValues(values: unknown[]): string[] {
-	return values.map((v) =>
-		v === null
-			? "null"
-			: typeof v === "string"
-				? v
-				: typeof v === "number" || typeof v === "boolean"
-					? String(v)
-					: String(v),
-	);
-}
-
-export type NormalizedSchemaNode =
-	| Record<string, unknown>
-	| unknown[]
-	| string
-	| number
-	| boolean
-	| null;
-
-/** Inline `$defs`/`definitions` references before the unsupported-key strip. */
-function dereference(
-	value: unknown,
-	defs: Map<string, unknown>,
-	seen: Set<unknown>,
-	depth: number,
-): NormalizedSchemaNode {
-	if (depth > 32) return {};
-	if (Array.isArray(value))
-		return value.map((v) => dereference(v, defs, seen, depth + 1));
-	if (typeof value !== "object" || value === null) {
-		return value as NormalizedSchemaNode;
-	}
-	if (seen.has(value)) return {};
-	seen.add(value);
-	const record = value as Record<string, unknown>;
-	const ref = record.$ref;
-	if (typeof ref === "string") {
-		const defName = ref.startsWith("#/$defs/")
-			? ref.slice("#/$defs/".length)
-			: ref.startsWith("#/definitions/")
-				? ref.slice("#/definitions/".length)
-				: undefined;
-		if (defName !== undefined) {
-			const target = defs.get(defName);
-			return target === undefined ? {} : dereference(target, defs, seen, depth + 1);
-		}
-	}
+function stripMetaSchema(schema: unknown): Record<string, unknown> | undefined {
+	if (!schema || typeof schema !== "object" || Array.isArray(schema))
+		return schema as Record<string, unknown> | undefined;
+	const omit = new Set(["$schema", "$id", "$defs", "definitions"]);
 	const out: Record<string, unknown> = {};
-	for (const [key, v] of Object.entries(record)) {
-		if (key === "$defs" || key === "definitions") continue;
-		out[key] = dereference(v, defs, seen, depth + 1);
+	for (const [key, value] of Object.entries(schema)) {
+		if (!omit.has(key)) out[key] = stripMetaSchema(value);
 	}
 	return out;
 }
 
-/**
- * Normalizes a schema node for Cloud Code Assist's proto-backed parameters schema.
- * Merges object combiners, removes anyOf/oneOf/allOf/not, converts enums to string,
- * and strips unsupported keywords.
- */
-function normalizeCcaNode(value: unknown): NormalizedSchemaNode {
-	if (typeof value === "boolean") return {};
-	if (typeof value !== "object" || value === null) {
-		return value as NormalizedSchemaNode;
-	}
-	if (Array.isArray(value)) return value.map(normalizeCcaNode);
+export function normalizeCustomToolSchema(schema: unknown): Record<string, unknown> | undefined {
+	if (!schema || typeof schema !== "object") return schema as Record<string, unknown> | undefined;
+	if (Array.isArray(schema)) return schema.map(normalizeCustomToolSchema) as any;
 
-	const record = value as Record<string, unknown>;
-
-	// Handle anyOf / oneOf / allOf composition
-	const combiners = ["anyOf", "oneOf", "allOf"] as const;
-	for (const combiner of combiners) {
-		const rawBranches = record[combiner];
-		if (Array.isArray(rawBranches) && rawBranches.length > 0) {
-			const nonNullBranches = rawBranches
-				.map(normalizeCcaNode)
-				.filter(
-					(b): b is Record<string, unknown> =>
-						typeof b === "object" && b !== null && !isNullSchema(b as Record<string, unknown>),
-				);
-
-			if (nonNullBranches.length === 0) {
-				return { type: "null" };
-			}
-
-			// If any branch is an object, merge properties from all object branches
-			const objectBranches = nonNullBranches.filter(
-				(b) => b.type === "object" || b.properties !== undefined,
-			);
-			if (objectBranches.length > 0) {
-				const mergedProps: Record<string, unknown> = {};
-				const mergedRequired: Set<string> = new Set();
-				let description: string | undefined =
-					typeof record.description === "string" ? record.description : undefined;
-
-				for (const branch of objectBranches) {
-					if (typeof branch.description === "string" && !description) {
-						description = branch.description;
-					}
-					if (typeof branch.properties === "object" && branch.properties !== null) {
-						for (const [k, v] of Object.entries(branch.properties as Record<string, unknown>)) {
-							mergedProps[k] = v;
-						}
-					}
-					if (Array.isArray(branch.required)) {
-						for (const req of branch.required) {
-							if (typeof req === "string") mergedRequired.add(req);
-						}
-					}
-				}
-
-				const outObj: Record<string, unknown> = {
-					type: "object",
-					properties: mergedProps,
-				};
-				if (mergedRequired.size > 0) {
-					outObj.required = Array.from(mergedRequired);
-				}
-				if (description) {
-					outObj.description = description;
-				}
-				return outObj;
-			}
-
-			// For scalar branches, pick the first non-null branch
-			const primary = nonNullBranches[0]!;
-			const outScalar: Record<string, unknown> = { ...primary };
-			if (typeof record.description === "string") {
-				outScalar.description = record.description;
-			}
-			return normalizeCcaNode(outScalar);
-		}
-	}
-
+	const s = schema as Record<string, unknown>;
 	const out: Record<string, unknown> = {};
 
-	for (const [key, raw] of Object.entries(record)) {
-		if (UNSUPPORTED_FIELDS.has(key)) continue;
-
-		if (key === "type") {
-			if (Array.isArray(raw)) {
-				const nonNull = raw.filter((t) => t !== "null");
-				out.type =
-					nonNull.length === 1
-						? nonNull[0]
-						: nonNull.length > 1
-							? nonNull[0]
-							: "string";
-			} else {
-				out.type = raw;
+	for (const [key, value] of Object.entries(s)) {
+		if (!CUSTOM_TOOL_SCHEMA_ALLOW.has(key)) {
+			if (key === "const" && s.enum === undefined && typeof value === "string") {
+				out.enum = [value];
 			}
 			continue;
 		}
-		if (key === "enum") {
-			if (Array.isArray(raw)) out.enum = stringifyEnumValues(raw);
+		if (key === "type" && Array.isArray(value)) {
+			const scalar = value.find((e) => typeof e === "string" && e !== "null");
+			if (scalar) out.type = scalar;
 			continue;
 		}
-		if (key === "const") {
-			out.enum = stringifyEnumValues([raw]);
-			continue;
-		}
-		if (key === "properties" && typeof raw === "object" && raw !== null) {
+		if (
+			key === "properties" &&
+			value &&
+			typeof value === "object" &&
+			!Array.isArray(value)
+		) {
 			const props: Record<string, unknown> = {};
-			for (const [name, schema] of Object.entries(
-				raw as Record<string, unknown>,
-			)) {
-				const propNorm = normalizeCcaNode(schema);
-				if (typeof propNorm === "object" && propNorm !== null && !Array.isArray(propNorm)) {
-					const p = propNorm as Record<string, unknown>;
-					if (!p.type && !p.properties && !p.items) {
-						p.type = "string";
-					}
-					props[name] = p;
-				} else {
-					props[name] = propNorm;
-				}
+			for (const [propName, propSchema] of Object.entries(value)) {
+				props[propName] = normalizeCustomToolSchema(propSchema);
 			}
 			out.properties = props;
 			continue;
 		}
-		if (key === "items") {
-			out.items = normalizeCcaNode(raw);
+		if (
+			key === "enum" &&
+			Array.isArray(value) &&
+			!value.every((e) => typeof e === "string")
+		) {
 			continue;
 		}
-		if (key === "required" && Array.isArray(raw)) {
-			out.required = raw.filter((item): item is string => typeof item === "string");
-			continue;
-		}
-		out[key] = raw;
+		out[key] = normalizeCustomToolSchema(value);
 	}
-
-	// Bare enum without a type: proto needs the scalar type
-	if (out.enum !== undefined && out.type === undefined) out.type = "string";
 
 	return out;
-}
-
-/** Normalize a tool schema for Cloud Code Assist wire parameters. */
-export function normalizeSchemaForCCA(value: unknown): Record<string, unknown> {
-	const root =
-		typeof value === "object" && value !== null && !Array.isArray(value)
-			? (value as Record<string, unknown>)
-			: {};
-
-	const defs = new Map<string, unknown>();
-	for (const defKey of ["$defs", "definitions"]) {
-		const defContainer = root[defKey];
-		if (typeof defContainer === "object" && defContainer !== null) {
-			for (const [name, schema] of Object.entries(
-				defContainer as Record<string, unknown>,
-			)) {
-				defs.set(name, schema);
-			}
-		}
-	}
-
-	const dereferenced = dereference(value, defs, new Set(), 0);
-	const normalized = normalizeCcaNode(dereferenced);
-
-	if (typeof normalized === "object" && normalized !== null && !Array.isArray(normalized)) {
-		const obj = normalized as Record<string, unknown>;
-		if (!obj.type) {
-			obj.type = "object";
-		}
-		if (!obj.properties) {
-			obj.properties = {};
-		}
-		return obj;
-	}
-
-	return { type: "object", properties: {} };
 }
 
 // ---------------------------------------------------------------------------
@@ -822,11 +603,16 @@ export function convertTools(
 	if (!tools || tools.length === 0) return [];
 	return [
 		{
-			functionDeclarations: tools.map((tool) => ({
-				name: tool.name,
-				description: tool.description || "",
-				parameters: normalizeSchemaForCCA(tool.parameters),
-			})),
+			functionDeclarations: tools.map((tool) => {
+				const schema =
+					stripMetaSchema(tool.parameters) ||
+					{ type: "object", properties: {} };
+				return {
+					name: tool.name,
+					description: tool.description || "",
+					parameters: normalizeCustomToolSchema(schema) as Record<string, unknown>,
+				};
+			}),
 		},
 	];
 }
