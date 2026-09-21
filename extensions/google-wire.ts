@@ -332,8 +332,10 @@ export function convertMessages(
 	);
 
 	for (const msg of transformedMessages) {
-		if (msg.role === "user") {
+		const role = (msg as { role: string }).role;
+		if (role === "user" || role === "system" || role === "developer") {
 			if (typeof msg.content === "string") {
+				if (!msg.content || msg.content.trim() === "") continue;
 				contents.push({
 					role: "user",
 					parts: [{ text: sanitizeSurrogates(msg.content) }],
@@ -342,7 +344,9 @@ export function convertMessages(
 				const parts: GeminiPart[] = [];
 				for (const item of msg.content as AnyContent[]) {
 					if (item.type === "text") {
-						parts.push({ text: sanitizeSurrogates(item.text ?? "") });
+						const text = sanitizeSurrogates(item.text ?? "");
+						if (text.trim().length === 0) continue;
+						parts.push({ text });
 					} else if (item.type === "image") {
 						const image = item as { type: "image"; mimeType: string; data: string };
 						parts.push({
@@ -709,7 +713,16 @@ function normalizeCcaNode(value: unknown): NormalizedSchemaNode {
 			for (const [name, schema] of Object.entries(
 				raw as Record<string, unknown>,
 			)) {
-				props[name] = normalizeCcaNode(schema);
+				const propNorm = normalizeCcaNode(schema);
+				if (typeof propNorm === "object" && propNorm !== null && !Array.isArray(propNorm)) {
+					const p = propNorm as Record<string, unknown>;
+					if (!p.type && !p.properties && !p.items) {
+						p.type = "string";
+					}
+					props[name] = p;
+				} else {
+					props[name] = propNorm;
+				}
 			}
 			out.properties = props;
 			continue;
@@ -755,8 +768,11 @@ export function normalizeSchemaForCCA(value: unknown): Record<string, unknown> {
 
 	if (typeof normalized === "object" && normalized !== null && !Array.isArray(normalized)) {
 		const obj = normalized as Record<string, unknown>;
-		if (!obj.type && obj.properties) {
+		if (!obj.type) {
 			obj.type = "object";
+		}
+		if (!obj.properties) {
+			obj.properties = {};
 		}
 		return obj;
 	}
