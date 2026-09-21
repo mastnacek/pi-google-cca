@@ -29,7 +29,6 @@ import {
 	isThinkingPart,
 	type ModelWire,
 	retainThoughtSignature,
-	sanitizeSurrogates,
 } from "./google-wire.ts";
 import {
 	antigravityUserAgent,
@@ -564,11 +563,30 @@ function buildCcaRequest(
 
 	const request: CcaRequest["request"] = { contents };
 
-	if (context.systemPrompt && context.systemPrompt.trim().length > 0) {
-		// Antigravity tags systemInstruction with role "user"
+	// pi-ai 0.86.0+ places system prompts inside context.messages instead of context.systemPrompt
+	const allMessages = context.messages as Array<{ role: string; content: any }>;
+	const systemMessages = allMessages.filter((m) => m.role === "system");
+	const derivedSystemPrompt =
+		(context.systemPrompt && context.systemPrompt.trim().length > 0)
+			? context.systemPrompt
+			: systemMessages
+					.map((m) => {
+						if (typeof m.content === "string") return m.content;
+						if (Array.isArray(m.content)) {
+							return m.content
+								.filter((c: any) => c.type === "text")
+								.map((c: any) => c.text)
+								.join("\n");
+						}
+						return "";
+					})
+					.join("\n\n");
+
+	if (derivedSystemPrompt && derivedSystemPrompt.trim().length > 0) {
+		// Antigravity tags systemInstruction with role "user" (mirrors the real client).
 		request.systemInstruction = {
 			...(isAntigravity ? { role: "user" } : {}),
-			parts: [{ text: context.systemPrompt }],
+			parts: [{ text: derivedSystemPrompt }],
 		};
 	}
 
@@ -934,7 +952,6 @@ export function streamGoogleCca(
 	const stream = createAssistantMessageEventStream();
 
 	(async () => {
-		const startTime = performance.now();
 		const output: AssistantMessage = {
 			role: "assistant",
 			content: [],
