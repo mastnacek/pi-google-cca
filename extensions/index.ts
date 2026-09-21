@@ -610,11 +610,6 @@ function buildCcaRequest(
 		};
 	}
 
-	// Claude on Antigravity always forces VALIDATED tool mode, even with no tools declared
-	if (isAntigravity && isClaude) {
-		request.toolConfig = { functionCallingConfig: { mode: "VALIDATED" } };
-	}
-
 	if (Object.keys(generationConfig).length > 0) {
 		request.generationConfig = generationConfig;
 	}
