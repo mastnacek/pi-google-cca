@@ -1772,6 +1772,14 @@ async function updateQuotaStatusline(ctx: ExtensionContext, force = false): Prom
 }
 
 export default async function (pi: ExtensionAPI): Promise<void> {
+	/** Unsubscribers from every `pi.on()`; drained on session_shutdown (AGENTS §5). */
+	const unsubscribers: Array<() => void> = [];
+
+	/** Retain a `pi.on()` return value; older engine typings declare it void. */
+	const track = (result: unknown): void => {
+		if (typeof result === "function") unsubscribers.push(result as () => void);
+	};
+
 	loadConfig();
 
 	const oauthConfig = {
@@ -1818,33 +1826,34 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 
 	// Initialize statusline on session start and refresh every 3 minutes
-	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+	track(pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 		await updateQuotaStatusline(ctx);
 		if (quotaRefreshTimer) clearInterval(quotaRefreshTimer);
 		quotaRefreshTimer = setInterval(() => {
 			void updateQuotaStatusline(ctx, true);
 		}, 180_000);
-	});
+	}));
 
 	// Refresh statusline after turn ends if Google provider was involved
-	pi.on("turn_end", async (_event, ctx: ExtensionContext) => {
+	track(pi.on("turn_end", async (_event, ctx: ExtensionContext) => {
 		if (ctx.model?.provider === "google" || ctx.model?.provider === "google-antigravity") {
 			invalidateQuotaCache();
 			await updateQuotaStatusline(ctx, true);
 		}
-	});
+	}));
 
 	// React to model changes
-	pi.on("model_select", async (event, ctx: ExtensionContext) => {
+	track(pi.on("model_select", async (event, ctx: ExtensionContext) => {
 		if (event.model.provider === "google" || event.model.provider === "google-antigravity") {
 			await updateQuotaStatusline(ctx);
 		} else if (ctx.hasUI) {
 			ctx.ui.setStatus("google-cca", undefined);
 		}
-	});
+	}));
 
 	// Clean up background timer on session shutdown
 	pi.on("session_shutdown", async () => {
+		while (unsubscribers.length > 0) unsubscribers.pop()?.();
 		if (quotaRefreshTimer) {
 			clearInterval(quotaRefreshTimer);
 			quotaRefreshTimer = null;
