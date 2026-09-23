@@ -30,6 +30,7 @@ Supports **Gemini 3.x/2.5**, **Anthropic Claude (Sonnet 4.6, Opus 4.6, Sonnet 4.
 - **Live Quota & Rate-Limit Tracking**:
   - Statusline display showing 5-hour and weekly window capacities (e.g. `🪐 Antigravity: 5h 93% (4h27m) · Wk 77% (3d8h)`).
   - `/google-quota` command for detailed quota breakdown and reset countdowns.
+  - Toggle the statusline badge with `/google-quota statusline on|off` (persisted in `~/.pi/agent/pi-google-cca.json`).
 
 ## Usage
 
@@ -52,7 +53,25 @@ Supports **Gemini 3.x/2.5**, **Anthropic Claude (Sonnet 4.6, Opus 4.6, Sonnet 4.
    ```bash
    /google-quota
    /google-quota refresh
+   /google-quota statusline off   # hide the statusline badge
+   /google-quota statusline on    # show it again
    ```
+
+## Configuration
+
+Global settings live in `~/.pi/agent/pi-google-cca.json`:
+
+```json
+{
+  "statusline": true
+}
+```
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `statusline` | `true` | Show the `🪐 Antigravity` quota badge in the statusline. |
+
+Toggle it in-app with `/google-quota statusline on|off`; edits take effect immediately and survive restarts.
 
 ## Files
 
@@ -60,3 +79,4 @@ Supports **Gemini 3.x/2.5**, **Anthropic Claude (Sonnet 4.6, Opus 4.6, Sonnet 4.
 - `extensions/oauth.ts` — Google OAuth flow, PKCE callback server, dynamic Antigravity client versioning, project discovery, and token refresh.
 - `extensions/google-wire.ts` — Wire-format message converters, thought signature preservation, and proto-backed JSON Schema normalization (`normalizeSchemaForCCA`).
 - `extensions/quota.ts` — Antigravity quota discovery (`retrieveUserQuotaSummary`), statusline renderer, and `/google-quota` banner.
+- `extensions/config.ts` — Global plugin config (`~/.pi/agent/pi-google-cca.json`).
