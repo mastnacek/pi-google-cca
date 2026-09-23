@@ -5,7 +5,6 @@
 import type {
 	Context,
 	Message,
-	Model,
 	Tool,
 	ToolCall,
 } from "@earendil-works/pi-ai";
@@ -365,6 +364,7 @@ export function convertMessages(
 			const parts: GeminiPart[] = [];
 			const isSameProviderAndModel =
 				assistantMsg.provider === model.provider && assistantMsg.model === model.id;
+			let addedSentinel = false;
 
 			for (const block of assistantMsg.content as AnyContent[]) {
 				if (block.type === "text") {
@@ -415,8 +415,11 @@ export function convertMessages(
 						toolCall.thoughtSignature,
 					);
 					// Cloud Code Assist rejects unsigned function calls on Gemini models.
-					const effectiveSignature =
-						thoughtSignature || (!isSameProviderAndModel ? SKIP_THOUGHT_SIGNATURE : undefined);
+					let effectiveSignature = thoughtSignature;
+					if (!effectiveSignature && !isSameProviderAndModel && !addedSentinel) {
+						effectiveSignature = SKIP_THOUGHT_SIGNATURE;
+						addedSentinel = true;
+					}
 
 					parts.push({
 						functionCall: {
@@ -546,6 +549,15 @@ export function normalizeCustomToolSchema(schema: unknown): Record<string, unkno
 	const s = schema as Record<string, unknown>;
 	const out: Record<string, unknown> = {};
 
+	if (Array.isArray(s.anyOf)) {
+		const nonNull = (s.anyOf as Array<Record<string, unknown>>).find(
+			(b) => b?.type !== "null" && typeof b?.type === "string",
+		);
+		if (nonNull && typeof nonNull.type === "string") {
+			out.type = nonNull.type;
+		}
+	}
+
 	for (const [key, value] of Object.entries(s)) {
 		if (!CUSTOM_TOOL_SCHEMA_ALLOW.has(key)) {
 			if (key === "const" && s.enum === undefined && typeof value === "string") {
@@ -571,11 +583,9 @@ export function normalizeCustomToolSchema(schema: unknown): Record<string, unkno
 			out.properties = props;
 			continue;
 		}
-		if (
-			key === "enum" &&
-			Array.isArray(value) &&
-			!value.every((e) => typeof e === "string")
-		) {
+		if (key === "enum" && Array.isArray(value)) {
+			out.enum = value.map((e) => String(e));
+			out.type = "string";
 			continue;
 		}
 		out[key] = normalizeCustomToolSchema(value);
@@ -616,3 +626,5 @@ export function convertTools(
 		},
 	];
 }
+
+export { normalizeCustomToolSchema as normalizeSchemaForCCA };
