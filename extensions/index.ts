@@ -1857,10 +1857,23 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		getArgumentCompletions: (prefix: string) => {
 			const tokens = prefix.split(/\s+/).filter(Boolean);
 			const trailingSpace = /\s$/.test(prefix);
+			const firstToken = tokens[0]?.toLowerCase();
+
+			// Non-terminal subcommands whose parameters are enumerable.
+			// A fully-typed token (no trailing space) must ALREADY yield the
+			// parameter list. Reason: the engine closes the picker after Tab and
+			// never re-opens it for the trailing-space form
+			// (`handleTabCompletion` forces FILE completion once a space exists),
+			// so relying on the trailing space alone strands the user at level 1.
+			const NON_TERMINAL = new Set(["statusline"]);
+			const atParameterLevel =
+				tokens.length > 1 ||
+				(trailingSpace && tokens.length === 1) ||
+				(tokens.length === 1 && firstToken !== undefined && NON_TERMINAL.has(firstToken));
 
 			// Second level: /google-quota statusline on|off
-			if (tokens.length > 1 || (trailingSpace && tokens.length === 1)) {
-				const cmd = tokens[0]?.toLowerCase();
+			if (atParameterLevel) {
+				const cmd = firstToken;
 				if (cmd === "statusline") {
 					const enabled = isStatuslineEnabled();
 					const items = [
