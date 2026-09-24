@@ -9,159 +9,37 @@ import type {
 	ToolCall,
 } from "@earendil-works/pi-ai";
 
-// ---------------------------------------------------------------------------
-// Wire types (subset of the Gemini generateContent schema we produce/consume)
-// ---------------------------------------------------------------------------
+import {
+	isThinkingPart,
+	retainThoughtSignature,
+	sanitizeSurrogates,
+	mapStopReasonString,
+	getGeminiMajorVersion,
+	requiresToolCallId,
+	supportsMultimodalFunctionResponse,
+	NON_VISION_USER_IMAGE_PLACEHOLDER,
+	NON_VISION_TOOL_IMAGE_PLACEHOLDER,
+	replaceImagesWithPlaceholder,
+	downgradeUnsupportedImages,
+	type GeminiPart,
+	type GeminiContent,
+	type GoogleThinkingLevel,
+	type AnyContent,
+	type ModelWire,
+} from "./wire-types.ts";
+import {
+	CUSTOM_TOOL_SCHEMA_ALLOW,
+	stripMetaSchema,
+	normalizeCustomToolSchema,
+	convertTools,
+	type FunctionDeclaration,
+} from "./schema.ts";
 
-export interface GeminiPart {
-	text?: string;
-	thought?: boolean;
-	thoughtSignature?: string;
-	inlineData?: { mimeType: string; data: string };
-	functionCall?: { name: string; args: Record<string, unknown>; id?: string };
-	functionResponse?: {
-		name: string;
-		response: Record<string, unknown>;
-		parts?: GeminiPart[];
-		id?: string;
-	};
-}
-
-export interface GeminiContent {
-	role: "user" | "model";
-	parts: GeminiPart[];
-}
-
-export type GoogleThinkingLevel =
-	| "THINKING_LEVEL_UNSPECIFIED"
-	| "MINIMAL"
-	| "LOW"
-	| "MEDIUM"
-	| "HIGH";
-
-export function isThinkingPart(
-	part: Pick<GeminiPart, "thought" | "thoughtSignature">,
-): boolean {
-	return part.thought === true;
-}
-
-export function retainThoughtSignature(
-	existing: string | undefined,
-	incoming: string | undefined,
-): string | undefined {
-	if (typeof incoming === "string" && incoming.length > 0) return incoming;
-	return existing;
-}
-
-/** Removes unpaired Unicode surrogates that break provider JSON serialization. */
-export function sanitizeSurrogates(text: string): string {
-	return text.replace(
-		/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
-		"",
-	);
-}
-
-/** Map a raw string finish reason to pi's StopReason. */
-export function mapStopReasonString(
-	reason: string,
-): "stop" | "length" | "error" {
-	switch (reason) {
-		case "STOP":
-			return "stop";
-		case "MAX_TOKENS":
-			return "length";
-		default:
-			return "error";
-	}
-}
-
-function getGeminiMajorVersion(modelId: string): number | undefined {
-	const match = modelId.toLowerCase().match(/^gemini(?:-live)?-(\d+)/);
-	if (!match) return undefined;
-	return Number.parseInt(match[1], 10);
-}
-
-/** Gemini 3+ (and Claude/gpt-oss behind CCA) require explicit tool call ids. */
-export function requiresToolCallId(modelId: string): boolean {
-	const major = getGeminiMajorVersion(modelId);
-	return (
-		modelId.startsWith("claude-") ||
-		modelId.startsWith("gpt-oss-") ||
-		(major !== undefined && major >= 3)
-	);
-}
-
-function supportsMultimodalFunctionResponse(modelId: string): boolean {
-	const major = getGeminiMajorVersion(modelId);
-	if (major !== undefined) return major >= 3;
-	return true;
-}
-
-// ---------------------------------------------------------------------------
-// transformMessages
-// ---------------------------------------------------------------------------
-
-const NON_VISION_USER_IMAGE_PLACEHOLDER =
-	"(image omitted: model does not support images)";
-const NON_VISION_TOOL_IMAGE_PLACEHOLDER =
-	"(tool image omitted: model does not support images)";
-
-type AnyContent = { type: string; text?: string; [key: string]: unknown };
-
-function replaceImagesWithPlaceholder(
-	content: AnyContent[],
-	placeholder: string,
-): AnyContent[] {
-	const result: AnyContent[] = [];
-	let previousWasPlaceholder = false;
-	for (const block of content) {
-		if (block.type === "image") {
-			if (!previousWasPlaceholder)
-				result.push({ type: "text", text: placeholder });
-			previousWasPlaceholder = true;
-			continue;
-		}
-		result.push(block);
-		previousWasPlaceholder = block.text === placeholder;
-	}
-	return result;
-}
-
-function downgradeUnsupportedImages(
-	messages: Message[],
-	model: ModelWire,
-): Message[] {
-	if (model.input.includes("image")) return messages;
-	return messages.map((msg) => {
-		if (msg.role === "user" && Array.isArray(msg.content)) {
-			return {
-				...msg,
-				content: replaceImagesWithPlaceholder(
-					msg.content as AnyContent[],
-					NON_VISION_USER_IMAGE_PLACEHOLDER,
-				),
-			} as Message;
-		}
-		if (msg.role === "toolResult") {
-			return {
-				...msg,
-				content: replaceImagesWithPlaceholder(
-					msg.content as AnyContent[],
-					NON_VISION_TOOL_IMAGE_PLACEHOLDER,
-				),
-			} as Message;
-		}
-		return msg;
-	});
-}
-
-/** Minimal structural type the converters need from a model. */
-export interface ModelWire {
-	id: string;
-	provider: string;
-	api: string;
-	input: ("text" | "image")[];
-}
+// Re-exported so existing consumers can keep importing from this module.
+// Re-exported so existing consumers can keep importing from this module.
+export { normalizeCustomToolSchema as normalizeSchemaForCCA };
+export * from "./wire-types.ts";
+export * from "./schema.ts";
 
 export function transformMessages(
 	messages: Message[],
@@ -302,6 +180,7 @@ export function transformMessages(
 // ---------------------------------------------------------------------------
 
 const base64SignaturePattern = /^[A-Za-z0-9+/]+={0,2}$/;
+
 export const SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
 
 function isValidThoughtSignature(signature: string | undefined): boolean {
@@ -514,117 +393,3 @@ export function convertMessages(
 	}
 	return contents;
 }
-
-// ---------------------------------------------------------------------------
-// Wire-schema normalization (normalizeCustomToolSchema)
-// Cloud Code Assist maps tool schemas onto a proto Schema that rejects most
-// validation/annotation keywords with INVALID_ARGUMENT "Cannot find field",
-// and proto enums are strings only.
-// ---------------------------------------------------------------------------
-
-const CUSTOM_TOOL_SCHEMA_ALLOW = new Set([
-	"type",
-	"description",
-	"properties",
-	"required",
-	"items",
-	"enum",
-]);
-
-function stripMetaSchema(schema: unknown): Record<string, unknown> | undefined {
-	if (!schema || typeof schema !== "object" || Array.isArray(schema))
-		return schema as Record<string, unknown> | undefined;
-	const omit = new Set(["$schema", "$id", "$defs", "definitions"]);
-	const out: Record<string, unknown> = {};
-	for (const [key, value] of Object.entries(schema)) {
-		if (!omit.has(key)) out[key] = stripMetaSchema(value);
-	}
-	return out;
-}
-
-export function normalizeCustomToolSchema(schema: unknown): Record<string, unknown> | undefined {
-	if (!schema || typeof schema !== "object") return schema as Record<string, unknown> | undefined;
-	if (Array.isArray(schema)) return schema.map(normalizeCustomToolSchema) as any;
-
-	const s = schema as Record<string, unknown>;
-	const out: Record<string, unknown> = {};
-
-	if (Array.isArray(s.anyOf)) {
-		const nonNull = (s.anyOf as Array<Record<string, unknown>>).find(
-			(b) => b?.type !== "null" && typeof b?.type === "string",
-		);
-		if (nonNull && typeof nonNull.type === "string") {
-			out.type = nonNull.type;
-		}
-	}
-
-	for (const [key, value] of Object.entries(s)) {
-		if (!CUSTOM_TOOL_SCHEMA_ALLOW.has(key)) {
-			if (key === "const" && s.enum === undefined && typeof value === "string") {
-				out.enum = [value];
-			}
-			continue;
-		}
-		if (key === "type" && Array.isArray(value)) {
-			const scalar = value.find((e) => typeof e === "string" && e !== "null");
-			if (scalar) out.type = scalar;
-			continue;
-		}
-		if (
-			key === "properties" &&
-			value &&
-			typeof value === "object" &&
-			!Array.isArray(value)
-		) {
-			const props: Record<string, unknown> = {};
-			for (const [propName, propSchema] of Object.entries(value)) {
-				props[propName] = normalizeCustomToolSchema(propSchema);
-			}
-			out.properties = props;
-			continue;
-		}
-		if (key === "enum" && Array.isArray(value)) {
-			out.enum = value.map((e) => String(e));
-			out.type = "string";
-			continue;
-		}
-		out[key] = normalizeCustomToolSchema(value);
-	}
-
-	return out;
-}
-
-// ---------------------------------------------------------------------------
-// convertTools
-// ---------------------------------------------------------------------------
-
-export interface FunctionDeclaration {
-	name: string;
-	description: string;
-	parameters: Record<string, unknown>;
-}
-
-/**
- * Tools → Gemini functionDeclarations with normalized `parameters` for Cloud Code Assist.
- */
-export function convertTools(
-	tools: Tool[],
-): { functionDeclarations: FunctionDeclaration[] }[] {
-	if (!tools || tools.length === 0) return [];
-	return [
-		{
-			functionDeclarations: tools.map((tool) => {
-				const schema =
-					stripMetaSchema(tool.parameters) ||
-					{ type: "object", properties: {} };
-				return {
-					name: tool.name,
-					description: tool.description || "",
-					parameters: normalizeCustomToolSchema(schema) as Record<string, unknown>,
-				};
-			}),
-		},
-	];
-}
-
-export { normalizeCustomToolSchema as normalizeSchemaForCCA };
