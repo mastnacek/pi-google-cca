@@ -85,3 +85,50 @@ describe("google-quota argument completions", () => {
 		assert.strictEqual(complete("refresh "), null);
 	});
 });
+
+describe("google-quota --global completions", () => {
+	it("offers --global at the first level as a non-terminal row", async () => {
+		const complete = await loadCompletion();
+		const row = (complete("") ?? []).find((i) => i.label === "--global");
+		assert.ok(row, "--global row missing");
+		assert.strictEqual(row!.value, "--global ", "non-terminal rows must end with a space");
+	});
+
+	it("returns only the flag row for a bare --global", async () => {
+		const complete = await loadCompletion();
+		assert.deepStrictEqual(values(complete("--global")), ["--global "]);
+	});
+
+	it("re-prefixes every child value exactly once", async () => {
+		const complete = await loadCompletion();
+		const items = complete("--global ")!;
+		assert.ok(items.length > 0, "expected suggestions under --global");
+		for (const item of items) {
+			assert.ok(item.value.startsWith("--global "), `unprefixed value: ${item.value}`);
+			assert.ok(!item.value.slice(8).startsWith("--global"), `nested flag: ${item.value}`);
+		}
+		const statusline = items.find((i) => i.label === "statusline");
+		assert.strictEqual(statusline!.value, "--global statusline ");
+	});
+
+	it("completes the parameter level under a --global prefix", async () => {
+		const complete = await loadCompletion();
+		assert.deepStrictEqual(values(complete("--global statusline"))!.sort(), [
+			"--global statusline off",
+			"--global statusline on",
+		]);
+	});
+
+	it("keeps the active-value annotation out of --global values", async () => {
+		const complete = await loadCompletion();
+		for (const item of complete("--global statusline on") ?? []) {
+			assert.ok(!item.value.includes("✓"), `value must stay clean: ${item.value}`);
+		}
+	});
+
+	it("leaves unprefixed completions untouched", async () => {
+		const complete = await loadCompletion();
+		assert.deepStrictEqual(values(complete("st")), ["statusline "]);
+		assert.strictEqual(complete("zzz"), null);
+	});
+});

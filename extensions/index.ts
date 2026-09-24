@@ -20,7 +20,6 @@ import {
 } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
-	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -39,17 +38,10 @@ import {
 	loginGoogle,
 	refreshGoogleToken,
 } from "./oauth.ts";
-import {
-	formatQuotaDetailBanner,
-	formatQuotaStatusline,
-	getAntigravityQuota,
-	invalidateQuotaCache,
-} from "./quota.ts";
-import {
-	isStatuslineEnabled,
-	loadConfig,
-	setStatuslineEnabled,
-} from "./config.ts";
+import { getAntigravityQuota, invalidateQuotaCache } from "./quota.ts";
+import { loadConfig, setConfigCwd } from "./config.ts";
+import { registerGoogleQuotaCommand } from "./command.ts";
+import { updateQuotaStatusline } from "./statusline.ts";
 
 const GEMINI_CLI_ENDPOINT = "https://cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_PRIMARY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
@@ -1756,21 +1748,6 @@ export async function fetchAntigravityDynamicModels(
 
 let quotaRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
-async function updateQuotaStatusline(ctx: ExtensionContext, force = false): Promise<void> {
-	if (!ctx.hasUI) return;
-	if (!isStatuslineEnabled()) {
-		ctx.ui.setStatus("google-cca", undefined);
-		return;
-	}
-	try {
-		const quota = await getAntigravityQuota(force);
-		const statusText = formatQuotaStatusline(quota);
-		ctx.ui.setStatus("google-cca", statusText ?? undefined);
-	} catch {
-		// Non-fatal statusline error
-	}
-}
-
 export default async function (pi: ExtensionAPI): Promise<void> {
 	/** Unsubscribers from every `pi.on()`; drained on session_shutdown (AGENTS §5). */
 	const unsubscribers: Array<() => void> = [];
@@ -1827,6 +1804,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	// Initialize statusline on session start and refresh every 3 minutes
 	track(pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+		// Point the config cascade at this session's project layer.
+		setConfigCwd(ctx.cwd);
 		await updateQuotaStatusline(ctx);
 		if (quotaRefreshTimer) clearInterval(quotaRefreshTimer);
 		quotaRefreshTimer = setInterval(() => {
@@ -1861,120 +1840,5 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 
 	// Register /google-quota command
-	pi.registerCommand("google-quota", {
-		description: "Display Google Antigravity quota and window resets",
-		getArgumentCompletions: (prefix: string) => {
-			const tokens = prefix.split(/\s+/).filter(Boolean);
-			const trailingSpace = /\s$/.test(prefix);
-			const firstToken = tokens[0]?.toLowerCase();
-
-			// Non-terminal subcommands whose parameters are enumerable.
-			// A fully-typed token (no trailing space) must ALREADY yield the
-			// parameter list. Reason: the engine closes the picker after Tab and
-			// never re-opens it for the trailing-space form
-			// (`handleTabCompletion` forces FILE completion once a space exists),
-			// so relying on the trailing space alone strands the user at level 1.
-			const NON_TERMINAL = new Set(["statusline"]);
-			const atParameterLevel =
-				tokens.length > 1 ||
-				(trailingSpace && tokens.length === 1) ||
-				(tokens.length === 1 && firstToken !== undefined && NON_TERMINAL.has(firstToken));
-
-			// Second level: /google-quota statusline on|off
-			if (atParameterLevel) {
-				const cmd = firstToken;
-				if (cmd === "statusline") {
-					const enabled = isStatuslineEnabled();
-					const items = [
-						{
-							value: "statusline on",
-							label: enabled ? "on ✓" : "on",
-							description: `Show the quota statusline badge${enabled ? " · ● ACTIVE" : ""}`,
-						},
-						{
-							value: "statusline off",
-							label: enabled ? "off" : "off ✓",
-							description: `Hide the quota statusline badge${enabled ? "" : " · ● ACTIVE"}`,
-						},
-					];
-					const clean = prefix.trim().toLowerCase();
-					const filtered = items.filter((i) => i.value.toLowerCase().startsWith(clean));
-					return filtered.length > 0 ? filtered : null;
-				}
-				return null;
-			}
-
-			// First level
-			const enabled = isStatuslineEnabled();
-			const items = [
-				{
-					value: "refresh",
-					label: "refresh",
-					description: "Force refresh quota from Google API",
-				},
-				{
-					value: "statusline ",
-					label: "statusline",
-					description: `Show or hide the quota statusline badge · ${enabled ? "● ON" : "○ OFF"}`,
-				},
-				{
-					value: "help",
-					label: "help",
-					description: "Show quota command help",
-				},
-			];
-			const clean = prefix.trim().toLowerCase();
-			const filtered = items.filter((i) => i.label.toLowerCase().startsWith(clean));
-			return filtered.length > 0 ? filtered : null;
-		},
-		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const sub = args.trim().toLowerCase();
-			if (sub === "help" || sub === "-h" || sub === "--help") {
-				const help = [
-					"# /google-quota — Antigravity Quota",
-					"",
-					"Usage:",
-					"  `/google-quota`                    — Show quota breakdown and window resets",
-					"  `/google-quota refresh`            — Force refresh quota and update statusline",
-					"  `/google-quota statusline on|off`  — Show or hide the statusline badge",
-					"  `/google-quota help`               — Show this help reference",
-				].join("\n");
-				ctx.ui.notify(help, "info");
-				return;
-			}
-
-			if (sub === "statusline" || sub.startsWith("statusline ")) {
-				const value = sub.split(/\s+/)[1];
-				if (value === "on" || value === "off") {
-					const enabled = value === "on";
-					setStatuslineEnabled(enabled);
-					await updateQuotaStatusline(ctx, true);
-					ctx.ui.notify(
-						enabled
-							? "Quota statusline badge enabled."
-							: "Quota statusline badge disabled.",
-						"info",
-					);
-					return;
-				}
-				const state = isStatuslineEnabled() ? "on" : "off";
-				ctx.ui.notify(
-					`Quota statusline is currently ${state}. Use \`/google-quota statusline on|off\`.`,
-					"info",
-				);
-				return;
-			}
-
-			const force = sub === "refresh";
-			if (force) invalidateQuotaCache();
-
-			const quota = await getAntigravityQuota(force);
-			const banner = formatQuotaDetailBanner(quota);
-			const statusText = formatQuotaStatusline(quota);
-			if (statusText && ctx.hasUI && isStatuslineEnabled()) {
-				ctx.ui.setStatus("google-cca", statusText);
-			}
-			ctx.ui.notify(banner, "info");
-		},
-	});
+	registerGoogleQuotaCommand(pi);
 }
