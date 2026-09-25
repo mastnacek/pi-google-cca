@@ -121,13 +121,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	}));
 
 	// Clean up background timer on session shutdown
-	pi.on("session_shutdown", async () => {
+	track(pi.on("session_shutdown", async () => {
 		while (unsubscribers.length > 0) unsubscribers.pop()?.();
 		if (quotaRefreshTimer) {
 			clearInterval(quotaRefreshTimer);
 			quotaRefreshTimer = null;
 		}
-	});
+	}));
 
 	// Register /google-quota command
 	registerGoogleQuotaCommand(pi);
